@@ -1,0 +1,6 @@
+{
+  "name": "VINSTOCK Motion Export Prototype",
+  "description": "Synchronized HTML/Vue motion overlay, video, and audio timeline editor with real FFmpeg H.264 MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
