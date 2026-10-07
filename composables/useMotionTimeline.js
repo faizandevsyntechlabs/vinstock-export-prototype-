@@ -80,6 +80,15 @@ export const VINSTOCK_ANIMATIONS = [
   },
 ];
 
+export const ASPECT_RATIO_PRESETS = [
+  { id: '16:9', label: '16:9', name: '16:9 Widescreen', width: 1920, height: 1080 },
+  { id: '16:9-720', label: '16:9 (720p)', name: '16:9 HD 720p', width: 1280, height: 720 },
+  { id: '9:16', label: '9:16', name: '9:16 Vertical', width: 1080, height: 1920 },
+  { id: '1:1', label: '1:1', name: '1:1 Square', width: 1080, height: 1080 },
+  { id: '4:5', label: '4:5', name: '4:5 Portrait', width: 1080, height: 1350 },
+  { id: '21:9', label: '21:9', name: '21:9 Ultrawide', width: 2560, height: 1080 },
+];
+
 // Singleton state so all components and composables share the exact same master timeline
 const composition = reactive({
   duration: 10,
@@ -88,6 +97,9 @@ const composition = reactive({
   isExporting: false,
   width: 1920,
   height: 1080,
+  aspectRatio: '16:9',
+  zoomMode: 'fit', // 'fit' | 'manual'
+  zoomLevel: 0.5,
   fps: 30,
   selectedTrack: 'animation', // 'animation' | 'video' | 'audio'
   previewQuality: '1080p · 30fps',
@@ -337,6 +349,75 @@ export function useMotionTimeline() {
     composition.selectedTrack = trackKey;
   }
 
+  function setScreenSize(width, height, aspectLabel = null) {
+    const prevW = composition.width || 1920;
+    const prevH = composition.height || 1080;
+    const nextW = Math.round(clamp(Number(width) || 1920, 320, 3840) / 2) * 2;
+    const nextH = Math.round(clamp(Number(height) || 1080, 240, 2160) / 2) * 2;
+
+    // Keep animation proportionally positioned inside new screen dimensions
+    if (prevW > 0 && prevH > 0) {
+      animationTrack.x = Math.round((Number(animationTrack.x) / prevW) * nextW);
+      animationTrack.y = Math.round((Number(animationTrack.y) / prevH) * nextH);
+    }
+
+    // If video was filling the previous canvas, fit it to the new canvas
+    if (
+      Math.abs((Number(videoTrack.width) || prevW) - prevW) <= 40 &&
+      Math.abs((Number(videoTrack.height) || prevH) - prevH) <= 40 &&
+      Math.abs(Number(videoTrack.x) || 0) <= 20 &&
+      Math.abs(Number(videoTrack.y) || 0) <= 20
+    ) {
+      videoTrack.x = 0;
+      videoTrack.y = 0;
+      videoTrack.width = nextW;
+      videoTrack.height = nextH;
+      videoTrack.scale = 1;
+    }
+
+    composition.width = nextW;
+    composition.height = nextH;
+
+    if (aspectLabel) {
+      composition.aspectRatio = aspectLabel;
+    } else {
+      const matched = ASPECT_RATIO_PRESETS.find(
+        (p) => p.width === nextW && p.height === nextH
+      );
+      if (matched) {
+        composition.aspectRatio = matched.id;
+      } else {
+        const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
+        const divisor = gcd(nextW, nextH);
+        const rw = Math.round(nextW / divisor);
+        const rh = Math.round(nextH / divisor);
+        composition.aspectRatio = rw <= 32 && rh <= 32 ? `${rw}:${rh}` : 'Custom';
+      }
+    }
+
+    composition.previewQuality = `${nextW}×${nextH} · ${composition.fps}fps`;
+  }
+
+  function setAspectRatioPreset(presetId) {
+    const found = ASPECT_RATIO_PRESETS.find((p) => p.id === presetId);
+    if (!found) return;
+    setScreenSize(found.width, found.height, found.id);
+  }
+
+  function setZoom(level) {
+    if (level === 'fit') {
+      composition.zoomMode = 'fit';
+      return;
+    }
+    composition.zoomMode = 'manual';
+    composition.zoomLevel = clamp(Number(level) || 0.5, 0.15, 2.0);
+  }
+
+  function stepZoom(delta) {
+    composition.zoomMode = 'manual';
+    composition.zoomLevel = Number(clamp((Number(composition.zoomLevel) || 0.5) + delta, 0.15, 2.0).toFixed(2));
+  }
+
   function selectAnimationPreset(animationId) {
     const found = VINSTOCK_ANIMATIONS.find((a) => a.id === animationId);
     if (!found) return;
@@ -422,6 +503,7 @@ export function useMotionTimeline() {
     animationTrack,
     audioTrack,
     animations: VINSTOCK_ANIMATIONS,
+    aspectPresets: ASPECT_RATIO_PRESETS,
     isVideoActive,
     videoLocalTime,
     isAnimationActive,
@@ -435,6 +517,10 @@ export function useMotionTimeline() {
     restart,
     onSeek,
     selectTrack,
+    setScreenSize,
+    setAspectRatioPreset,
+    setZoom,
+    stepZoom,
     selectAnimationPreset,
     setVideoFile,
     setAudioFile,

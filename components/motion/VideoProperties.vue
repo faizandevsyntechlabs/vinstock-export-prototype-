@@ -21,8 +21,8 @@ function onFileSelected(e) {
 function resetVideoTransform() {
   videoTrack.x = 0;
   videoTrack.y = 0;
-  videoTrack.width = 1920;
-  videoTrack.height = 1080;
+  videoTrack.width = Number(composition.width) || 1920;
+  videoTrack.height = Number(composition.height) || 1080;
   videoTrack.scale = 1;
 }
 </script>
@@ -102,7 +102,7 @@ function resetVideoTransform() {
           class="px-2 py-0.5 rounded bg-[#151922] hover:bg-[#1E2430] text-[10px] font-mono text-slate-300 border border-[#242A38] cursor-pointer"
           @click="resetVideoTransform"
         >
-          Fit 1920×1080
+          Fit {{ composition.width }}×{{ composition.height }}
         </button>
       </div>
 

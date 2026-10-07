@@ -12,6 +12,8 @@ const {
   composition,
   videoTrack,
   audioTrack,
+  aspectPresets,
+  setAspectRatioPreset,
   setVideoFile,
   setAudioFile,
 } = useMotionTimeline();
@@ -42,6 +44,10 @@ function onHeaderAudioChange(e) {
   if (file) {
     setAudioFile(file);
   }
+}
+
+function onHeaderAspectChange(e) {
+  setAspectRatioPreset(e.target.value);
 }
 
 onMounted(() => {
@@ -108,9 +114,23 @@ onMounted(() => {
           {{ isGeneratingSample ? 'Loading Sample...' : 'Reload Sample Media' }}
         </button>
         <span class="hidden lg:inline text-slate-600" aria-hidden="true">·</span>
-        <span class="hidden lg:inline font-mono text-slate-400 whitespace-nowrap">
-          {{ composition.previewQuality }}
-        </span>
+        <select
+          :value="composition.aspectRatio"
+          class="hidden lg:inline-block bg-[#0B0D11] border border-[#242A38] rounded px-2 py-1 font-mono text-xs text-slate-200 focus:outline-none focus:border-amber-500 cursor-pointer"
+          title="Select Composition Aspect Ratio & Screen Size"
+          @change="onHeaderAspectChange"
+        >
+          <option
+            v-for="preset in aspectPresets"
+            :key="preset.id"
+            :value="preset.id"
+          >
+            {{ preset.name }} ({{ preset.width }}×{{ preset.height }})
+          </option>
+          <option v-if="!aspectPresets.some((p) => p.id === composition.aspectRatio)" :value="composition.aspectRatio">
+            Custom ({{ composition.width }}×{{ composition.height }})
+          </option>
+        </select>
       </nav>
 
       <!-- Zone 3: Primary Export Action -->

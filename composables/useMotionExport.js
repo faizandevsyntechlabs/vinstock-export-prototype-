@@ -14,7 +14,7 @@ const exportState = reactive({
   progress: 0,
   currentFrame: 0,
   totalFrames: 0,
-  resolution: '1280x720', // '1280x720' | '1920x1080'
+  resolution: 'canvas', // 'canvas' | '720p-scale' | '1080p-scale'
   fps: 30,
   engine: 'client-mp4', // 'client-mp4' (Vercel/Static & Universal) | 'server-ffmpeg'
   downloadUrl: '',
@@ -355,12 +355,15 @@ export function useMotionExport() {
    * Draw a single master timeline frame at `masterTime` onto `ctx`.
    */
   async function drawMasterFrame(ctx, scaleRatio, masterTime) {
+    const compW = Number(composition.width) || 1920;
+    const compH = Number(composition.height) || 1080;
+
     ctx.save();
     ctx.scale(scaleRatio, scaleRatio);
 
     // Background layer
     ctx.fillStyle = '#0B0D11';
-    ctx.fillRect(0, 0, 1920, 1080);
+    ctx.fillRect(0, 0, compW, compH);
 
     // Layer 1: Uploaded Video Track
     const vStart = Number(videoTrack.startTime) || 0;
@@ -369,8 +372,8 @@ export function useMotionExport() {
       const videoEl = await seekVideoElementForExport(masterTime);
       if (videoEl && videoEl.readyState >= 2) {
         const vScale = Number(videoTrack.scale) || 1;
-        const drawW = (Number(videoTrack.width) || 1920) * vScale;
-        const drawH = (Number(videoTrack.height) || 1080) * vScale;
+        const drawW = (Number(videoTrack.width) || compW) * vScale;
+        const drawH = (Number(videoTrack.height) || compH) * vScale;
         const drawX = Number(videoTrack.x) || 0;
         const drawY = Number(videoTrack.y) || 0;
         try {
@@ -490,7 +493,7 @@ export function useMotionExport() {
     offscreen.width = targetWidth;
     offscreen.height = targetHeight;
     const ctx = offscreen.getContext('2d', { alpha: false });
-    const scaleRatio = targetWidth / 1920;
+    const scaleRatio = targetWidth / (Number(composition.width) || 1920);
     const frameDurationMicros = Math.round(1_000_000 / fps);
 
     for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
@@ -638,7 +641,7 @@ export function useMotionExport() {
     offscreen.width = targetWidth;
     offscreen.height = targetHeight;
     const ctx = offscreen.getContext('2d', { alpha: false });
-    const scaleRatio = targetWidth / 1920;
+    const scaleRatio = targetWidth / (Number(composition.width) || 1920);
 
     const batchSize = 15;
     let frameBatch = [];
@@ -711,8 +714,12 @@ export function useMotionExport() {
     exportState.downloadUrl = '';
     exportState.errorMessage = '';
 
-    const [targetWidth, targetHeight] =
-      exportState.resolution === '1920x1080' ? [1920, 1080] : [1280, 720];
+    const compW = Number(composition.width) || 1920;
+    const compH = Number(composition.height) || 1080;
+    const factor = exportState.resolution === '720p-scale' ? 0.6667 : 1;
+    // H.264 requires dimensions divisible by 2
+    const targetWidth = Math.max(320, Math.round((compW * factor) / 2) * 2);
+    const targetHeight = Math.max(240, Math.round((compH * factor) / 2) * 2);
     const fps = Number(exportState.fps) || 30;
     const totalDuration = clamp(Number(composition.duration) || 10, 1, 30);
     const totalFrames = Math.max(1, Math.round(totalDuration * fps));

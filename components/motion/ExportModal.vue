@@ -79,14 +79,18 @@ const formattedFileSize = computed(() => {
         <!-- Export Configuration & Track Summary -->
         <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="block text-xs text-slate-400 mb-1">Output Resolution</label>
+            <label class="block text-xs text-slate-400 mb-1">Output Resolution ({{ composition.aspectRatio }})</label>
             <select
               v-model="exportState.resolution"
               :disabled="isBusy"
               class="w-full px-3 py-2 rounded-lg bg-[#0B0D11] border border-[#242A38] text-xs font-mono text-white disabled:opacity-50"
             >
-              <option value="1280x720">1280 × 720 (HD 720p · Fast)</option>
-              <option value="1920x1080">1920 × 1080 (Full HD 1080p)</option>
+              <option value="canvas">
+                Full Screen ({{ composition.width }} × {{ composition.height }})
+              </option>
+              <option value="720p-scale">
+                Scaled Fast ({{ Math.round((composition.width * 0.6667) / 2) * 2 }} × {{ Math.round((composition.height * 0.6667) / 2) * 2 }})
+              </option>
             </select>
           </div>
           <div>
