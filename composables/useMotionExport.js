@@ -1,4 +1,5 @@
 import { reactive } from 'vue';
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import {
   useMotionTimeline,
   computeAnimationEnvelope,
@@ -15,6 +16,7 @@ const exportState = reactive({
   totalFrames: 0,
   resolution: '1280x720', // '1280x720' | '1920x1080'
   fps: 30,
+  engine: 'client-mp4', // 'client-mp4' (Vercel/Static & Universal) | 'server-ffmpeg'
   downloadUrl: '',
   fileName: 'vinstock-motion-export.mp4',
   fileSize: 0,
@@ -65,17 +67,20 @@ function drawRoundedRect(ctx, x, y, w, h, r) {
  * same deterministic envelope math (computeAnimationEnvelope) and properties as the Vue components.
  */
 function renderVinstockAnimationToCanvas(ctx, animationTrack, masterTimeSec) {
-  const { animationId, startTime, duration, x, y, scale, animationSpeed, customProperties } =
-    animationTrack;
+  const { animationId, x, y, scale, animationSpeed, customProperties } = animationTrack;
+  const startTime = Number(animationTrack.startTime) || 0;
+  const duration = Math.max(0.1, Number(animationTrack.duration) || 5);
 
   if (!animationId) return;
   if (masterTimeSec < startTime || masterTimeSec > startTime + duration) return;
 
-  const progress = clamp((masterTimeSec - startTime) / Math.max(0.1, duration), 0, 1);
+  const progress = clamp((masterTimeSec - startTime) / duration, 0, 1);
   const env = computeAnimationEnvelope(progress, duration, animationSpeed);
   if (env.visibility <= 0.005) return;
 
   const baseScale = Number(scale) || 1;
+  const posX = Number(x) || 960;
+  const posY = Number(y) || 540;
   const accent = customProperties?.accentColor || '#F59E0B';
 
   ctx.save();
@@ -88,7 +93,7 @@ function renderVinstockAnimationToCanvas(ctx, animationTrack, masterTimeSec) {
     const titleText = customProperties?.text || 'BEYOND THE FRAME';
     const subtext = customProperties?.subtext || 'VINSTOCK MOTION SERIES · 2026';
 
-    ctx.translate(x, y + translateY);
+    ctx.translate(posX, posY + translateY);
     ctx.scale(currentScale, currentScale);
 
     ctx.font = `800 ${fontSize}px "Syne", sans-serif`;
@@ -138,7 +143,7 @@ function renderVinstockAnimationToCanvas(ctx, animationTrack, masterTimeSec) {
     const primaryText = customProperties?.primaryText || 'John Smith';
     const secondaryText = customProperties?.secondaryText || 'Creative Director';
 
-    ctx.translate(x + slideX, y);
+    ctx.translate(posX + slideX, posY);
     ctx.scale(baseScale, baseScale);
 
     ctx.font = '700 38px "Syne", sans-serif';
@@ -181,7 +186,7 @@ function renderVinstockAnimationToCanvas(ctx, animationTrack, masterTimeSec) {
     const brandLabel = customProperties?.brandLabel || 'VINSTOCK';
     const tagline = customProperties?.tagline || 'MOTION GRAPHICS ENGINE';
 
-    ctx.translate(x, y);
+    ctx.translate(posX, posY);
     ctx.scale(s, s);
 
     const boxW = 420;
@@ -235,7 +240,7 @@ function renderVinstockAnimationToCanvas(ctx, animationTrack, masterTimeSec) {
     const badgeText = customProperties?.text || 'FEATURED';
     const sublabel = customProperties?.sublabel || 'LIMITED RELEASE';
 
-    ctx.translate(x, y);
+    ctx.translate(posX, posY);
     ctx.rotate(tiltRad);
     ctx.scale(s, s);
 
@@ -273,6 +278,53 @@ function renderVinstockAnimationToCanvas(ctx, animationTrack, masterTimeSec) {
   ctx.restore();
 }
 
+/**
+ * Mixes the uploaded audio track (respecting startTime, duration, volume, and mute)
+ * into a 44.1kHz stereo AudioBuffer for exact MP4 muxing.
+ */
+async function renderSynchronizedAudioBuffer(audioTrack, totalDurationSec) {
+  if (!audioTrack.file || audioTrack.muted || Number(audioTrack.volume) <= 0) {
+    return null;
+  }
+
+  try {
+    const sampleRate = 44100;
+    const totalSamples = Math.max(sampleRate, Math.ceil(totalDurationSec * sampleRate));
+    const arrayBuffer = await audioTrack.file.arrayBuffer();
+
+    const tempAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+    let decodedBuffer = null;
+    try {
+      decodedBuffer = await tempAudioCtx.decodeAudioData(arrayBuffer.slice(0));
+    } finally {
+      if (tempAudioCtx.state !== 'closed') {
+        await tempAudioCtx.close().catch(() => {});
+      }
+    }
+
+    if (!decodedBuffer) return null;
+
+    const offlineCtx = new OfflineAudioContext(2, totalSamples, sampleRate);
+    const source = offlineCtx.createBufferSource();
+    source.buffer = decodedBuffer;
+
+    const gainNode = offlineCtx.createGain();
+    gainNode.gain.value = clamp(Number(audioTrack.volume ?? 0.85), 0, 2);
+
+    source.connect(gainNode);
+    gainNode.connect(offlineCtx.destination);
+
+    const startSec = clamp(Number(audioTrack.startTime) || 0, 0, totalDurationSec);
+    const durSec = clamp(Number(audioTrack.duration) || totalDurationSec, 0.1, totalDurationSec - startSec);
+
+    source.start(startSec, 0, durSec);
+    return await offlineCtx.startRendering();
+  } catch (err) {
+    console.warn('Could not decode audio for WebCodecs muxing:', err);
+    return null;
+  }
+}
+
 export function useMotionExport() {
   const { composition, videoTrack, animationTrack, audioTrack, pause, seekTo } =
     useMotionTimeline();
@@ -299,6 +351,355 @@ export function useMotionExport() {
     exportState.isOpen = false;
   }
 
+  /**
+   * Draw a single master timeline frame at `masterTime` onto `ctx`.
+   */
+  async function drawMasterFrame(ctx, scaleRatio, masterTime) {
+    ctx.save();
+    ctx.scale(scaleRatio, scaleRatio);
+
+    // Background layer
+    ctx.fillStyle = '#0B0D11';
+    ctx.fillRect(0, 0, 1920, 1080);
+
+    // Layer 1: Uploaded Video Track
+    const vStart = Number(videoTrack.startTime) || 0;
+    const vDur = Math.max(0.1, Number(videoTrack.duration) || 0);
+    if (videoTrack.url && masterTime >= vStart && masterTime <= vStart + vDur) {
+      const videoEl = await seekVideoElementForExport(masterTime);
+      if (videoEl && videoEl.readyState >= 2) {
+        const vScale = Number(videoTrack.scale) || 1;
+        const drawW = (Number(videoTrack.width) || 1920) * vScale;
+        const drawH = (Number(videoTrack.height) || 1080) * vScale;
+        const drawX = Number(videoTrack.x) || 0;
+        const drawY = Number(videoTrack.y) || 0;
+        try {
+          ctx.drawImage(videoEl, drawX, drawY, drawW, drawH);
+        } catch (_e) {
+          // Ignore transient video draw error
+        }
+      }
+    }
+
+    // Layer 2: VINSTOCK HTML/Vue Animation Overlay
+    renderVinstockAnimationToCanvas(ctx, animationTrack, masterTime);
+
+    ctx.restore();
+  }
+
+  /**
+   * 100% Client-Side Hardware-Accelerated H.264 + AAC MP4 Exporter using WebCodecs + mp4-muxer.
+   * Works seamlessly on Vercel static deployments (https://vinstock-export-prototype.vercel.app/)
+   * as well as local dev without requiring server-side /tmp or FFmpeg binaries.
+   */
+  async function exportWithBrowserWebCodecs(targetWidth, targetHeight, fps, totalDuration, totalFrames) {
+    if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
+      throw new Error('WebCodecs API is not supported in this browser.');
+    }
+
+    // 1. Find universal H.264 codec profile supported by hardware/browser
+    const candidateCodecs = [
+      'avc1.4d0028', // Main Profile Level 4.0
+      'avc1.420028', // Baseline Profile Level 4.0
+      'avc1.42001f', // Baseline Profile Level 3.1
+      'avc1.640028', // High Profile Level 4.0
+    ];
+
+    let selectedVideoConfig = null;
+    for (const codecStr of candidateCodecs) {
+      try {
+        const check = await VideoEncoder.isConfigSupported({
+          codec: codecStr,
+          width: targetWidth,
+          height: targetHeight,
+          bitrate: targetWidth >= 1920 ? 8_000_000 : 5_000_000,
+          framerate: fps,
+        });
+        if (check.supported) {
+          selectedVideoConfig = check.config;
+          break;
+        }
+      } catch (_e) {}
+    }
+
+    if (!selectedVideoConfig) {
+      throw new Error('No compatible H.264 VideoEncoder profile found on this device.');
+    }
+
+    // 2. Prepare synchronized audio buffer & check AAC encoder support
+    let renderedAudioBuffer = await renderSynchronizedAudioBuffer(audioTrack, totalDuration);
+    let audioEncoderConfig = null;
+
+    if (renderedAudioBuffer && typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined') {
+      try {
+        const audioCheck = await AudioEncoder.isConfigSupported({
+          codec: 'mp4a.40.2',
+          sampleRate: 44100,
+          numberOfChannels: 2,
+          bitrate: 128000,
+        });
+        if (audioCheck.supported) {
+          audioEncoderConfig = audioCheck.config;
+        }
+      } catch (_e) {
+        audioEncoderConfig = null;
+      }
+    }
+
+    const includeAudio = Boolean(renderedAudioBuffer && audioEncoderConfig);
+
+    // 3. Configure MP4 Muxer
+    const muxerTarget = new ArrayBufferTarget();
+    const muxer = new Muxer({
+      target: muxerTarget,
+      video: {
+        codec: 'avc',
+        width: targetWidth,
+        height: targetHeight,
+        frameRate: fps,
+      },
+      ...(includeAudio
+        ? {
+            audio: {
+              codec: 'aac',
+              numberOfChannels: 2,
+              sampleRate: 44100,
+            },
+          }
+        : {}),
+      fastStart: 'in-memory',
+      firstTimestampBehavior: 'offset',
+    });
+
+    let videoEncoderError = null;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        muxer.addVideoChunk(chunk, meta);
+      },
+      error: (err) => {
+        videoEncoderError = err;
+      },
+    });
+    videoEncoder.configure(selectedVideoConfig);
+
+    // 4. Render & Encode Every Frame Deterministically
+    exportState.status = 'rendering';
+    exportState.phaseLabel = 'Rendering frames';
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = targetWidth;
+    offscreen.height = targetHeight;
+    const ctx = offscreen.getContext('2d', { alpha: false });
+    const scaleRatio = targetWidth / 1920;
+    const frameDurationMicros = Math.round(1_000_000 / fps);
+
+    for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+      if (videoEncoderError) throw videoEncoderError;
+
+      const masterTime = frameIdx / fps;
+      composition.currentTime = masterTime;
+
+      await drawMasterFrame(ctx, scaleRatio, masterTime);
+
+      const timestampMicros = Math.round((frameIdx / fps) * 1_000_000);
+      const videoFrame = new VideoFrame(offscreen, {
+        timestamp: timestampMicros,
+        duration: frameDurationMicros,
+      });
+
+      videoEncoder.encode(videoFrame, { keyFrame: frameIdx % fps === 0 });
+      videoFrame.close();
+
+      // Yield briefly if encoder queue builds up
+      while (videoEncoder.encodeQueueSize > 10) {
+        await new Promise((r) => setTimeout(r, 8));
+      }
+
+      exportState.currentFrame = frameIdx + 1;
+      exportState.progress = Math.round(10 + ((frameIdx + 1) / totalFrames) * 65);
+
+      if (frameIdx % 5 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    // 5. Process & Encode Synchronized Audio Track if present
+    exportState.status = 'processing';
+    exportState.phaseLabel = 'Processing media';
+    exportState.progress = 80;
+
+    if (includeAudio && renderedAudioBuffer) {
+      try {
+        const audioEncoder = new AudioEncoder({
+          output: (chunk, meta) => {
+            muxer.addAudioChunk(chunk, meta);
+          },
+          error: (err) => {
+            console.warn('AudioEncoder warning:', err);
+          },
+        });
+        audioEncoder.configure(audioEncoderConfig);
+
+        const ch0 = renderedAudioBuffer.getChannelData(0);
+        const ch1 =
+          renderedAudioBuffer.numberOfChannels > 1
+            ? renderedAudioBuffer.getChannelData(1)
+            : ch0;
+        const totalSamples = renderedAudioBuffer.length;
+        const chunkSize = 1024;
+
+        for (let offset = 0; offset < totalSamples; offset += chunkSize) {
+          const framesInChunk = Math.min(chunkSize, totalSamples - offset);
+          const planarData = new Float32Array(framesInChunk * 2);
+          planarData.set(ch0.subarray(offset, offset + framesInChunk), 0);
+          planarData.set(ch1.subarray(offset, offset + framesInChunk), framesInChunk);
+
+          const audioData = new AudioData({
+            format: 'f32-planar',
+            sampleRate: 44100,
+            numberOfFrames: framesInChunk,
+            numberOfChannels: 2,
+            timestamp: Math.round((offset / 44100) * 1_000_000),
+            data: planarData,
+          });
+          audioEncoder.encode(audioData);
+          audioData.close();
+        }
+
+        await audioEncoder.flush();
+        audioEncoder.close();
+      } catch (audErr) {
+        console.warn('Skipping audio stream due to encoder error:', audErr);
+      }
+    }
+
+    // 6. Finalize H.264 + AAC MP4 Container
+    exportState.status = 'encoding';
+    exportState.phaseLabel = 'Encoding';
+    exportState.progress = 92;
+
+    await videoEncoder.flush();
+    videoEncoder.close();
+    muxer.finalize();
+
+    const mp4Blob = new Blob([muxerTarget.buffer], { type: 'video/mp4' });
+    return {
+      mp4Blob,
+      codec: includeAudio ? 'H.264 (WebCodecs) + AAC-LC' : 'H.264 (WebCodecs MP4)',
+    };
+  }
+
+  /**
+   * Server-side FFmpeg export pipeline (used when running with the Express/Node backend).
+   */
+  async function exportWithServerFfmpeg(targetWidth, targetHeight, fps, totalDuration, totalFrames) {
+    const sessionId = `vinstock_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    let audioBase64 = null;
+    let audioExt = 'mp3';
+    if (audioTrack.file && !audioTrack.muted && Number(audioTrack.volume) > 0) {
+      audioBase64 = await fileToBase64(audioTrack.file);
+      const nameParts = (audioTrack.fileName || '').split('.');
+      if (nameParts.length > 1) {
+        audioExt = nameParts[nameParts.length - 1].toLowerCase();
+      }
+    }
+
+    const initRes = await fetch('/api/export/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId,
+        fps,
+        width: targetWidth,
+        height: targetHeight,
+        duration: totalDuration,
+        audioConfig: {
+          startTime: Number(audioTrack.startTime) || 0,
+          duration: Number(audioTrack.duration) || totalDuration,
+          volume: Number(audioTrack.volume ?? 0.85),
+          muted: Boolean(audioTrack.muted),
+        },
+        audioBase64,
+        audioExt,
+      }),
+    });
+
+    if (!initRes.ok) {
+      const err = new Error('Server FFmpeg endpoint unavailable');
+      err.status = initRes.status;
+      throw err;
+    }
+
+    exportState.status = 'rendering';
+    exportState.phaseLabel = 'Rendering frames';
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = targetWidth;
+    offscreen.height = targetHeight;
+    const ctx = offscreen.getContext('2d', { alpha: false });
+    const scaleRatio = targetWidth / 1920;
+
+    const batchSize = 15;
+    let frameBatch = [];
+
+    for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+      const masterTime = frameIdx / fps;
+      composition.currentTime = masterTime;
+
+      await drawMasterFrame(ctx, scaleRatio, masterTime);
+
+      const dataUrl = offscreen.toDataURL('image/jpeg', 0.9);
+      frameBatch.push({ index: frameIdx, dataUrl });
+
+      exportState.currentFrame = frameIdx + 1;
+      exportState.progress = Math.round(8 + ((frameIdx + 1) / totalFrames) * 68);
+
+      if (frameBatch.length >= batchSize || frameIdx === totalFrames - 1) {
+        exportState.status = frameIdx === totalFrames - 1 ? 'processing' : 'rendering';
+        exportState.phaseLabel =
+          frameIdx === totalFrames - 1 ? 'Processing media' : 'Rendering frames';
+
+        const batchRes = await fetch('/api/export/frames', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            frames: frameBatch,
+          }),
+        });
+
+        if (!batchRes.ok) {
+          const errData = await batchRes.json().catch(() => ({}));
+          throw new Error(errData.error || 'Failed while uploading rendered frame batch');
+        }
+        frameBatch = [];
+      }
+    }
+
+    exportState.status = 'encoding';
+    exportState.phaseLabel = 'Encoding';
+    exportState.progress = 85;
+
+    const finalRes = await fetch('/api/export/finalize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId }),
+    });
+
+    if (!finalRes.ok) {
+      const errData = await finalRes.json().catch(() => ({}));
+      throw new Error(errData.error || 'FFmpeg MP4 encoding failed');
+    }
+
+    const finalData = await finalRes.json();
+    const mp4Blob = base64ToMp4Blob(finalData.mp4Base64);
+    return {
+      mp4Blob,
+      codec: finalData.codec || 'H.264 (Main@L4.0) + AAC-LC',
+    };
+  }
+
   async function startMp4Export() {
     const savedTime = composition.currentTime;
     pause();
@@ -319,156 +720,61 @@ export function useMotionExport() {
     exportState.totalFrames = totalFrames;
     exportState.currentFrame = 0;
 
-    const sessionId = `vinstock_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
     try {
-      // 1. Prepare audio file payload if present
-      let audioBase64 = null;
-      let audioExt = 'mp3';
-      if (audioTrack.file && !audioTrack.muted && Number(audioTrack.volume) > 0) {
-        audioBase64 = await fileToBase64(audioTrack.file);
-        const nameParts = (audioTrack.fileName || '').split('.');
-        if (nameParts.length > 1) {
-          audioExt = nameParts[nameParts.length - 1].toLowerCase();
+      let result = null;
+
+      if (exportState.engine === 'server-ffmpeg') {
+        try {
+          result = await exportWithServerFfmpeg(
+            targetWidth,
+            targetHeight,
+            fps,
+            totalDuration,
+            totalFrames
+          );
+        } catch (serverErr) {
+          // Automatic fallback to Browser WebCodecs + mp4-muxer when deployed to Vercel / static host
+          console.warn(
+            'Server FFmpeg endpoint unavailable, falling back to in-browser H.264/AAC MP4 muxer:',
+            serverErr.message
+          );
+          result = await exportWithBrowserWebCodecs(
+            targetWidth,
+            targetHeight,
+            fps,
+            totalDuration,
+            totalFrames
+          );
+        }
+      } else {
+        try {
+          result = await exportWithBrowserWebCodecs(
+            targetWidth,
+            targetHeight,
+            fps,
+            totalDuration,
+            totalFrames
+          );
+        } catch (clientErr) {
+          console.warn('Browser WebCodecs unavailable, falling back to Server FFmpeg:', clientErr.message);
+          result = await exportWithServerFfmpeg(
+            targetWidth,
+            targetHeight,
+            fps,
+            totalDuration,
+            totalFrames
+          );
         }
       }
 
-      const initRes = await fetch('/api/export/init', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          fps,
-          width: targetWidth,
-          height: targetHeight,
-          duration: totalDuration,
-          audioConfig: {
-            startTime: audioTrack.startTime,
-            duration: audioTrack.duration,
-            volume: audioTrack.volume,
-            muted: audioTrack.muted,
-          },
-          audioBase64,
-          audioExt,
-        }),
-      });
-
-      if (!initRes.ok) {
-        const errData = await initRes.json().catch(() => ({}));
-        throw new Error(errData.error || 'Failed to initialize FFmpeg export session');
-      }
-
-      // 2. Render frames deterministically at logical 1920x1080 scaled to targetWidth x targetHeight
-      exportState.status = 'rendering';
-      exportState.phaseLabel = 'Rendering frames';
-
-      const offscreen = document.createElement('canvas');
-      offscreen.width = targetWidth;
-      offscreen.height = targetHeight;
-      const ctx = offscreen.getContext('2d', { alpha: false });
-      const scaleRatio = targetWidth / 1920;
-
-      const batchSize = 15;
-      let frameBatch = [];
-
-      for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-        const masterTime = frameIdx / fps;
-        composition.currentTime = masterTime;
-
-        // Clear logical 1920x1080 canvas coordinate space
-        ctx.save();
-        ctx.scale(scaleRatio, scaleRatio);
-
-        // Background layer
-        ctx.fillStyle = '#0B0D11';
-        ctx.fillRect(0, 0, 1920, 1080);
-
-        // Layer 1: Uploaded Video Track
-        if (
-          videoTrack.url &&
-          masterTime >= videoTrack.startTime &&
-          masterTime <= videoTrack.startTime + videoTrack.duration
-        ) {
-          const videoEl = await seekVideoElementForExport(masterTime);
-          if (videoEl && videoEl.readyState >= 2) {
-            const vScale = Number(videoTrack.scale) || 1;
-            const drawW = (Number(videoTrack.width) || 1920) * vScale;
-            const drawH = (Number(videoTrack.height) || 1080) * vScale;
-            const drawX = Number(videoTrack.x) || 0;
-            const drawY = Number(videoTrack.y) || 0;
-            try {
-              ctx.drawImage(videoEl, drawX, drawY, drawW, drawH);
-            } catch (_e) {
-              // Ignore transient video draw error
-            }
-          }
-        }
-
-        // Layer 2: VINSTOCK HTML/Vue Animation Overlay
-        renderVinstockAnimationToCanvas(ctx, animationTrack, masterTime);
-
-        ctx.restore();
-
-        const dataUrl = offscreen.toDataURL('image/jpeg', 0.9);
-        frameBatch.push({ index: frameIdx, dataUrl });
-
-        exportState.currentFrame = frameIdx + 1;
-        exportState.progress = Math.round(8 + ((frameIdx + 1) / totalFrames) * 68);
-
-        if (frameBatch.length >= batchSize || frameIdx === totalFrames - 1) {
-          exportState.status = frameIdx === totalFrames - 1 ? 'processing' : 'rendering';
-          exportState.phaseLabel =
-            frameIdx === totalFrames - 1 ? 'Processing media' : 'Rendering frames';
-
-          const batchRes = await fetch('/api/export/frames', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId,
-              frames: frameBatch,
-            }),
-          });
-
-          if (!batchRes.ok) {
-            const errData = await batchRes.json().catch(() => ({}));
-            throw new Error(errData.error || 'Failed while uploading rendered frame batch');
-          }
-          frameBatch = [];
-        }
-      }
-
-      // 3. Finalize & Encode via FFmpeg (H.264 + AAC)
-      exportState.status = 'encoding';
-      exportState.phaseLabel = 'Encoding';
-      exportState.progress = 85;
-
-      const finalRes = await fetch('/api/export/finalize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
-      });
-
-      if (!finalRes.ok) {
-        const errData = await finalRes.json().catch(() => ({}));
-        throw new Error(errData.error || 'FFmpeg MP4 encoding failed');
-      }
-
-      const finalData = await finalRes.json();
       if (exportState.downloadUrl && exportState.downloadUrl.startsWith('blob:')) {
         URL.revokeObjectURL(exportState.downloadUrl);
       }
 
-      if (finalData.mp4Base64) {
-        const mp4Blob = base64ToMp4Blob(finalData.mp4Base64);
-        exportState.downloadUrl = URL.createObjectURL(mp4Blob);
-        exportState.fileSize = mp4Blob.size;
-      } else {
-        exportState.downloadUrl = finalData.downloadUrl;
-        exportState.fileSize = finalData.fileSize || 0;
-      }
-
+      exportState.downloadUrl = URL.createObjectURL(result.mp4Blob);
+      exportState.fileSize = result.mp4Blob.size;
       exportState.fileName = `vinstock-motion-export-${Date.now().toString().slice(-5)}.mp4`;
-      exportState.codec = finalData.codec || 'H.264 (Main@L4.0) + AAC-LC';
+      exportState.codec = result.codec;
       exportState.progress = 100;
       exportState.status = 'complete';
       exportState.phaseLabel = 'Complete';

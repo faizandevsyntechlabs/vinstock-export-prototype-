@@ -90,10 +90,15 @@ const formattedFileSize = computed(() => {
             </select>
           </div>
           <div>
-            <label class="block text-xs text-slate-400 mb-1">Codec & Frame Rate</label>
-            <div class="px-3 py-2 rounded-lg bg-[#0B0D11] border border-[#242A38] text-xs font-mono text-slate-300">
-              H.264 + AAC · {{ exportState.fps }} FPS · {{ composition.duration }}s
-            </div>
+            <label class="block text-xs text-slate-400 mb-1">Encoding Engine</label>
+            <select
+              v-model="exportState.engine"
+              :disabled="isBusy"
+              class="w-full px-3 py-2 rounded-lg bg-[#0B0D11] border border-[#242A38] text-xs font-mono text-white disabled:opacity-50"
+            >
+              <option value="client-mp4">Browser H.264/AAC (Vercel Ready)</option>
+              <option value="server-ffmpeg">Server FFmpeg (Auto-Fallback)</option>
+            </select>
           </div>
         </div>
 
