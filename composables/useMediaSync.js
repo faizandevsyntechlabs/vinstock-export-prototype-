@@ -1,63 +1,95 @@
-import { ref, watch, onBeforeUnmount } from 'vue';
+import { watch, onBeforeUnmount } from 'vue';
 import { useMotionTimeline, clamp } from './useMotionTimeline.js';
 
-const sharedVideoRef = ref(null);
-const sharedAudioRef = ref(null);
+const videoElementsMap = new Map();
+const audioElementsMap = new Map();
 
 export function useMediaSync() {
   const {
     composition,
     videoTrack,
+    videoTracks,
     audioTrack,
+    audioTracks,
     isVideoActive,
     isAudioActive,
     onSeek,
   } = useMotionTimeline();
 
-  function registerVideoElement(el) {
-    sharedVideoRef.value = el;
+  function registerVideoElement(trackIdOrEl, maybeEl) {
+    if (typeof trackIdOrEl === 'string') {
+      if (maybeEl) {
+        videoElementsMap.set(trackIdOrEl, maybeEl);
+      } else {
+        videoElementsMap.delete(trackIdOrEl);
+      }
+    } else if (trackIdOrEl) {
+      const id = videoTracks[0]?.id || 'video_1';
+      videoElementsMap.set(id, trackIdOrEl);
+    }
     syncVideoState(true);
   }
 
-  function registerAudioElement(el) {
-    sharedAudioRef.value = el;
+  function registerAudioElement(trackIdOrEl, maybeEl) {
+    if (typeof trackIdOrEl === 'string') {
+      if (maybeEl) {
+        audioElementsMap.set(trackIdOrEl, maybeEl);
+      } else {
+        audioElementsMap.delete(trackIdOrEl);
+      }
+    } else if (trackIdOrEl) {
+      const id = audioTracks[0]?.id || 'audio_1';
+      audioElementsMap.set(id, trackIdOrEl);
+    }
     syncAudioState(true);
   }
 
-  function syncVideoState(forceSeek = false) {
-    const videoEl = sharedVideoRef.value;
-    if (!videoEl || !videoTrack.url || composition.isExporting) return;
+  function syncSingleVideoTrack(vTrack, forceSeek = false) {
+    const videoEl = videoElementsMap.get(vTrack.id);
+    if (!videoEl || !vTrack.url || composition.isExporting) return;
 
-    videoEl.volume = clamp(Number(videoTrack.volume ?? 0.8), 0, 1);
+    const rate = clamp(Number(vTrack.playbackRate) || 1, 0.25, 4);
+    if (Math.abs((videoEl.playbackRate || 1) - rate) > 0.01) {
+      try {
+        videoEl.playbackRate = rate;
+      } catch (_e) {}
+    }
 
-    const localTime = composition.currentTime - videoTrack.startTime;
+    videoEl.volume = clamp(Number(vTrack.volume ?? 0.8), 0, 1);
+
+    const vStart = Number(vTrack.startTime) || 0;
+    const vDur = Math.max(0.1, Number(vTrack.duration) || 0);
+    const trimIn = Math.max(0, Number(vTrack.trimStart) || 0);
+    const maxMediaDur = Math.max(0.2, videoEl.duration || vTrack.naturalDuration || 10);
+    const trimOut = clamp(Number(vTrack.trimEnd) || maxMediaDur, trimIn + 0.1, maxMediaDur);
+
+    const elapsedInClip = composition.currentTime - vStart;
     const withinWindow =
-      composition.currentTime >= videoTrack.startTime &&
-      composition.currentTime <= videoTrack.startTime + videoTrack.duration;
+      composition.currentTime >= vStart &&
+      composition.currentTime <= vStart + vDur;
 
     if (withinWindow) {
-      const clampedLocal = clamp(localTime, 0, Math.max(0.1, videoEl.duration || videoTrack.naturalDuration || 10));
-      const drift = Math.abs((videoEl.currentTime || 0) - clampedLocal);
+      const clampedSourceTime = clamp(trimIn + elapsedInClip * rate, trimIn, trimOut);
+      const drift = Math.abs((videoEl.currentTime || 0) - clampedSourceTime);
 
       if (forceSeek || !composition.isPlaying) {
         if (drift > 0.03) {
           try {
-            videoEl.currentTime = clampedLocal;
-          } catch (_e) {
-            // Ignore transient readiness errors
-          }
+            videoEl.currentTime = clampedSourceTime;
+          } catch (_e) {}
         }
-      } else if (drift > 0.22) {
+      } else if (drift > 0.24 * rate) {
         try {
-          videoEl.currentTime = clampedLocal;
-        } catch (_e) {
-          // Ignore transient readiness errors
-        }
+          videoEl.currentTime = clampedSourceTime;
+        } catch (_e) {}
       }
 
-      if (composition.isPlaying && videoEl.paused) {
+      if (composition.isPlaying && videoEl.paused && (videoEl.currentTime || 0) < trimOut - 0.02) {
         videoEl.play().catch(() => {});
-      } else if (!composition.isPlaying && !videoEl.paused) {
+      } else if (
+        (!composition.isPlaying || (videoEl.currentTime || 0) >= trimOut) &&
+        !videoEl.paused
+      ) {
         videoEl.pause();
       }
     } else {
@@ -67,20 +99,57 @@ export function useMediaSync() {
     }
   }
 
-  function syncAudioState(forceSeek = false) {
-    const audioEl = sharedAudioRef.value;
-    if (!audioEl || !audioTrack.url || composition.isExporting) return;
+  function syncVideoState(forceSeek = false) {
+    if (composition.isExporting) return;
+    for (const vTrack of videoTracks) {
+      syncSingleVideoTrack(vTrack, forceSeek);
+    }
+  }
 
-    audioEl.muted = Boolean(audioTrack.muted);
-    audioEl.volume = audioTrack.muted ? 0 : clamp(Number(audioTrack.volume ?? 0.85), 0, 1);
+  function computeAudioFadeMultiplier(aTrack, elapsedInClip, clipDuration) {
+    const fadeIn = Math.max(0, Number(aTrack.fadeIn) || 0);
+    const fadeOut = Math.max(0, Number(aTrack.fadeOut) || 0);
+    let mult = 1;
+    if (fadeIn > 0.01 && elapsedInClip < fadeIn) {
+      mult *= clamp(elapsedInClip / fadeIn, 0, 1);
+    }
+    const remaining = clipDuration - elapsedInClip;
+    if (fadeOut > 0.01 && remaining < fadeOut) {
+      mult *= clamp(remaining / fadeOut, 0, 1);
+    }
+    return clamp(mult, 0, 1);
+  }
 
-    const localTime = composition.currentTime - audioTrack.startTime;
+  function syncSingleAudioTrack(aTrack, forceSeek = false) {
+    const audioEl = audioElementsMap.get(aTrack.id);
+    if (!audioEl || !aTrack.url || composition.isExporting) return;
+
+    const rate = clamp(Number(aTrack.playbackRate) || 1, 0.25, 4);
+    if (Math.abs((audioEl.playbackRate || 1) - rate) > 0.01) {
+      try {
+        audioEl.playbackRate = rate;
+      } catch (_e) {}
+    }
+
+    const aStart = Number(aTrack.startTime) || 0;
+    const aDur = Math.max(0.1, Number(aTrack.duration) || 0);
+    const trimIn = Math.max(0, Number(aTrack.trimStart) || 0);
+    const maxMediaDur = Math.max(0.2, audioEl.duration || aTrack.naturalDuration || 10);
+    const trimOut = clamp(Number(aTrack.trimEnd) || maxMediaDur, trimIn + 0.1, maxMediaDur);
+
+    const elapsedInClip = composition.currentTime - aStart;
     const withinWindow =
-      composition.currentTime >= audioTrack.startTime &&
-      composition.currentTime <= audioTrack.startTime + audioTrack.duration;
+      composition.currentTime >= aStart &&
+      composition.currentTime <= aStart + aDur;
 
-    if (withinWindow && !audioTrack.muted) {
-      const clampedLocal = clamp(localTime, 0, Math.max(0.1, audioEl.duration || audioTrack.naturalDuration || 10));
+    const fadeMult = withinWindow ? computeAudioFadeMultiplier(aTrack, elapsedInClip, aDur) : 0;
+    audioEl.muted = Boolean(aTrack.muted);
+    audioEl.volume = aTrack.muted
+      ? 0
+      : clamp(Number(aTrack.volume ?? 0.85) * fadeMult, 0, 1);
+
+    if (withinWindow && !aTrack.muted) {
+      const clampedLocal = clamp(trimIn + elapsedInClip * rate, trimIn, trimOut);
       const drift = Math.abs((audioEl.currentTime || 0) - clampedLocal);
 
       if (forceSeek || !composition.isPlaying) {
@@ -89,15 +158,18 @@ export function useMediaSync() {
             audioEl.currentTime = clampedLocal;
           } catch (_e) {}
         }
-      } else if (drift > 0.22) {
+      } else if (drift > 0.24 * rate) {
         try {
           audioEl.currentTime = clampedLocal;
         } catch (_e) {}
       }
 
-      if (composition.isPlaying && audioEl.paused) {
+      if (composition.isPlaying && audioEl.paused && (audioEl.currentTime || 0) < trimOut - 0.02) {
         audioEl.play().catch(() => {});
-      } else if (!composition.isPlaying && !audioEl.paused) {
+      } else if (
+        (!composition.isPlaying || (audioEl.currentTime || 0) >= trimOut) &&
+        !audioEl.paused
+      ) {
         audioEl.pause();
       }
     } else {
@@ -107,20 +179,24 @@ export function useMediaSync() {
     }
   }
 
-  /**
-   * Deterministic frame-accurate video seek used during MP4 export.
-   */
-  function seekVideoElementForExport(masterTimeSec) {
+  function syncAudioState(forceSeek = false) {
+    if (composition.isExporting) return;
+    for (const aTrack of audioTracks) {
+      syncSingleAudioTrack(aTrack, forceSeek);
+    }
+  }
+
+  function seekSingleVideoForExport(vTrack, masterTimeSec) {
     return new Promise((resolve) => {
-      const videoEl = sharedVideoRef.value;
-      if (!videoEl || !videoTrack.url) {
+      const videoEl = videoElementsMap.get(vTrack.id);
+      if (!videoEl || !vTrack.url) {
         resolve(null);
         return;
       }
 
-      const withinWindow =
-        masterTimeSec >= videoTrack.startTime &&
-        masterTimeSec <= videoTrack.startTime + videoTrack.duration;
+      const vStart = Number(vTrack.startTime) || 0;
+      const vDur = Math.max(0.1, Number(vTrack.duration) || 0);
+      const withinWindow = masterTimeSec >= vStart && masterTimeSec <= vStart + vDur;
 
       if (!withinWindow) {
         resolve(null);
@@ -131,11 +207,14 @@ export function useMediaSync() {
         videoEl.pause();
       }
 
-      const maxDur = Math.max(0.05, (videoEl.duration || videoTrack.naturalDuration || 10) - 0.01);
-      const targetLocal = clamp(masterTimeSec - videoTrack.startTime, 0, maxDur);
+      const rate = clamp(Number(vTrack.playbackRate) || 1, 0.25, 4);
+      const maxDur = Math.max(0.05, (videoEl.duration || vTrack.naturalDuration || 10) - 0.01);
+      const trimIn = Math.max(0, Number(vTrack.trimStart) || 0);
+      const trimOut = clamp(Number(vTrack.trimEnd) || maxDur, trimIn + 0.05, maxDur);
+      const targetLocal = clamp(trimIn + (masterTimeSec - vStart) * rate, trimIn, trimOut);
 
       if (Math.abs(videoEl.currentTime - targetLocal) < 0.015 && videoEl.readyState >= 2) {
-        resolve(videoEl);
+        resolve({ track: vTrack, videoEl });
         return;
       }
 
@@ -144,7 +223,7 @@ export function useMediaSync() {
         if (resolved) return;
         resolved = true;
         videoEl.removeEventListener('seeked', done);
-        resolve(videoEl);
+        resolve({ track: vTrack, videoEl });
       };
 
       const timeoutId = setTimeout(done, 180);
@@ -166,19 +245,37 @@ export function useMediaSync() {
     });
   }
 
+  /**
+   * Seeks all active video tracks at `masterTimeSec` in parallel for multi-video MP4/WebM export.
+   */
+  async function seekAllVideosForExport(masterTimeSec) {
+    const promises = videoTracks.map((vTrack) => seekSingleVideoForExport(vTrack, masterTimeSec));
+    const results = await Promise.all(promises);
+    return results.filter(Boolean);
+  }
+
+  // Legacy single-video helper for backward compatibility
+  async function seekVideoElementForExport(masterTimeSec) {
+    const first = await seekSingleVideoForExport(videoTrack, masterTimeSec);
+    return first ? first.videoEl : null;
+  }
+
   const stopWatch = watch(
     () => [
       composition.currentTime,
       composition.isPlaying,
-      videoTrack.startTime,
-      videoTrack.duration,
-      videoTrack.volume,
-      videoTrack.url,
-      audioTrack.startTime,
-      audioTrack.duration,
-      audioTrack.volume,
-      audioTrack.muted,
-      audioTrack.url,
+      videoTracks
+        .map(
+          (v) =>
+            `${v.id}:${v.startTime}:${v.duration}:${v.trimStart}:${v.trimEnd}:${v.playbackRate}:${v.volume}:${v.url}`
+        )
+        .join('|'),
+      audioTracks
+        .map(
+          (a) =>
+            `${a.id}:${a.startTime}:${a.duration}:${a.trimStart}:${a.trimEnd}:${a.playbackRate}:${a.fadeIn}:${a.fadeOut}:${a.volume}:${a.muted}:${a.url}`
+        )
+        .join('|'),
     ],
     () => {
       syncVideoState(false);
@@ -197,13 +294,12 @@ export function useMediaSync() {
   });
 
   return {
-    sharedVideoRef,
-    sharedAudioRef,
     registerVideoElement,
     registerAudioElement,
     syncVideoState,
     syncAudioState,
     seekVideoElementForExport,
+    seekAllVideosForExport,
     isVideoActive,
     isAudioActive,
   };

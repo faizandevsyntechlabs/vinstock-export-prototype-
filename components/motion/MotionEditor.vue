@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
 import { useMotionTimeline } from '../../composables/useMotionTimeline.js';
 import { useMotionExport } from '../../composables/useMotionExport.js';
 import { useSampleMedia } from '../../composables/useSampleMedia.js';
@@ -11,11 +11,18 @@ import ExportModal from './ExportModal.vue';
 const {
   composition,
   videoTrack,
+  videoTracks,
   audioTrack,
+  audioTracks,
   aspectPresets,
   setAspectRatioPreset,
   setVideoFile,
+  addVideoTrack,
   setAudioFile,
+  addAudioTrack,
+  undo,
+  redo,
+  togglePlay,
 } = useMotionTimeline();
 
 const { openExportModal } = useMotionExport();
@@ -33,37 +40,74 @@ function triggerHeaderAudioUpload() {
 }
 
 function onHeaderVideoChange(e) {
-  const file = e.target.files?.[0];
-  if (file) {
-    setVideoFile(file);
-  }
+  const files = Array.from(e.target.files || []);
+  files.forEach((file) => {
+    const emptySlot = videoTracks.find((v) => !v.url);
+    if (emptySlot) {
+      setVideoFile(file, emptySlot.id);
+    } else {
+      addVideoTrack(file);
+    }
+  });
+  e.target.value = '';
 }
 
 function onHeaderAudioChange(e) {
-  const file = e.target.files?.[0];
-  if (file) {
-    setAudioFile(file);
-  }
+  const files = Array.from(e.target.files || []);
+  files.forEach((file) => {
+    const emptySlot = audioTracks.find((a) => !a.url);
+    if (emptySlot) {
+      setAudioFile(file, emptySlot.id);
+    } else {
+      addAudioTrack(file);
+    }
+  });
+  e.target.value = '';
 }
 
 function onHeaderAspectChange(e) {
   setAspectRatioPreset(e.target.value);
 }
 
+function onGlobalKeyDown(e) {
+  const tag = (e.target?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    if (e.shiftKey) {
+      redo();
+    } else {
+      undo();
+    }
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+    e.preventDefault();
+    redo();
+  } else if (e.code === 'Space') {
+    e.preventDefault();
+    togglePlay();
+  }
+}
+
 onMounted(() => {
-  // Initialize studio sample video & audio if none uploaded yet so all 3 tracks are immediately playable
+  window.addEventListener('keydown', onGlobalKeyDown);
   if (!videoTrack.url && !audioTrack.url) {
     loadSampleMedia();
   }
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKeyDown);
 });
 </script>
 
 <template>
   <div class="h-screen w-screen flex flex-col bg-[#0B0D11] text-[#F1F5F9] overflow-hidden">
-    <!-- Hidden File Inputs for Top Bar Quick Upload -->
+    <!-- Hidden File Inputs for Top Bar Quick Upload (Supports Multiple Files) -->
     <input
       ref="headerVideoInputRef"
       type="file"
+      multiple
       accept="video/mp4,video/webm"
       class="hidden"
       @change="onHeaderVideoChange"
@@ -71,6 +115,7 @@ onMounted(() => {
     <input
       ref="headerAudioInputRef"
       type="file"
+      multiple
       accept="audio/mp3,audio/mpeg,audio/wav,audio/x-m4a,audio/mp4,audio/*"
       class="hidden"
       @change="onHeaderAudioChange"
@@ -145,7 +190,7 @@ onMounted(() => {
             <polyline points="7 10 12 15 17 10" />
             <line x1="12" y1="15" x2="12" y2="3" />
           </svg>
-          <span>Export MP4</span>
+          <span>Export MP4 / WebM</span>
         </button>
       </div>
     </header>
@@ -156,10 +201,10 @@ onMounted(() => {
       <PropertiesPanel />
     </div>
 
-    <!-- 3. MASTER TIMELINE: Playback Controls + Ruler + 3 Synchronized Tracks -->
+    <!-- 3. MASTER TIMELINE: Playback Controls + Ruler + Multi-Layer Synchronized Tracks -->
     <Timeline />
 
-    <!-- 4. REAL FFMPEG MP4 EXPORT MODAL -->
+    <!-- 4. MP4 / WEBM EXPORT MODAL -->
     <ExportModal />
   </div>
 </template>

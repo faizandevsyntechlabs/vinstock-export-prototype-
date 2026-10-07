@@ -38,6 +38,7 @@ export async function handleExportInit(req, res) {
   try {
     const {
       sessionId,
+      format = 'mp4',
       fps = 30,
       width = 1280,
       height = 720,
@@ -78,6 +79,7 @@ export async function handleExportInit(req, res) {
 
     const meta = {
       sessionId,
+      format: format === 'webm' ? 'webm' : 'mp4',
       fps: Number(fps) || 30,
       width: Number(width) || 1280,
       height: Number(height) || 720,
@@ -140,7 +142,9 @@ export async function handleExportFinalize(req, res) {
     }
 
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
-    const outputMp4Path = path.join(sessionDir, 'vinstock-motion-export.mp4');
+    const isWebm = meta.format === 'webm';
+    const ext = isWebm ? 'webm' : 'mp4';
+    const outputFilePath = path.join(sessionDir, `vinstock-motion-export.${ext}`);
     const fps = Number(meta.fps) || 30;
     const totalDuration = Math.max(0.5, Number(meta.duration) || 10);
 
@@ -153,55 +157,87 @@ export async function handleExportFinalize(req, res) {
 
     const framePattern = path.join(sessionDir, 'frame_%05d.jpg');
 
-    // Universal H.264 Main Profile + BT.709 + mp42 brand for Windows Media Player, QuickTime, and browsers
-    const videoEncodeArgs = [
-      '-vf',
-      'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
-      '-c:v',
-      'libx264',
-      '-profile:v',
-      'main',
-      '-level',
-      '4.0',
-      '-pix_fmt',
-      'yuv420p',
-      '-colorspace',
-      'bt709',
-      '-color_primaries',
-      'bt709',
-      '-color_trc',
-      'bt709',
-      '-color_range',
-      'tv',
-      '-preset',
-      'fast',
-      '-crf',
-      '20',
-      '-r',
-      String(fps),
-      '-vsync',
-      'cfr',
-    ];
+    const videoEncodeArgs = isWebm
+      ? [
+          '-vf',
+          'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
+          '-c:v',
+          'libvpx-vp9',
+          '-b:v',
+          '0',
+          '-crf',
+          '30',
+          '-deadline',
+          'realtime',
+          '-cpu-used',
+          '4',
+          '-pix_fmt',
+          'yuv420p',
+          '-r',
+          String(fps),
+        ]
+      : [
+          '-vf',
+          'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
+          '-c:v',
+          'libx264',
+          '-profile:v',
+          'main',
+          '-level',
+          '4.0',
+          '-pix_fmt',
+          'yuv420p',
+          '-colorspace',
+          'bt709',
+          '-color_primaries',
+          'bt709',
+          '-color_trc',
+          'bt709',
+          '-color_range',
+          'tv',
+          '-preset',
+          'fast',
+          '-crf',
+          '20',
+          '-r',
+          String(fps),
+          '-vsync',
+          'cfr',
+        ];
 
-    const audioEncodeArgs = [
-      '-c:a',
-      'aac',
-      '-profile:a',
-      'aac_low',
-      '-b:a',
-      '192k',
-      '-ar',
-      '44100',
-      '-ac',
-      '2',
-      '-brand',
-      'mp42',
-      '-movflags',
-      '+faststart',
-      '-t',
-      String(totalDuration.toFixed(3)),
-      outputMp4Path,
-    ];
+    const audioEncodeArgs = isWebm
+      ? [
+          '-c:a',
+          'libopus',
+          '-b:a',
+          '160k',
+          '-ar',
+          '48000',
+          '-ac',
+          '2',
+          '-t',
+          String(totalDuration.toFixed(3)),
+          outputFilePath,
+        ]
+      : [
+          '-c:a',
+          'aac',
+          '-profile:a',
+          'aac_low',
+          '-b:a',
+          '192k',
+          '-ar',
+          '44100',
+          '-ac',
+          '2',
+          '-brand',
+          'mp42',
+          '-movflags',
+          '+faststart',
+          '-t',
+          String(totalDuration.toFixed(3)),
+          outputFilePath,
+        ];
 
     const buildSilentArgs = () => [
       '-y',
@@ -229,7 +265,6 @@ export async function handleExportFinalize(req, res) {
       const audioVol = Math.max(0, Math.min(2, Number(meta.audioConfig.volume ?? 1)));
       const delayMs = Math.round(audioStart * 1000);
 
-      // Mix user audio over a silent stereo base track of exact composition duration
       const delayFilter = delayMs > 0 ? `,adelay=${delayMs}|${delayMs}` : '';
       const filterComplex = `[1:a]aformat=sample_rates=44100:channel_layouts=stereo[base];[2:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=0:${audioDur.toFixed(3)},asetpts=PTS-STARTPTS,volume=${audioVol.toFixed(3)}${delayFilter}[useraud];[base][useraud]amix=inputs=2:duration=first:dropout_transition=0:weights="1 1"[aout]`;
 
@@ -260,24 +295,25 @@ export async function handleExportFinalize(req, res) {
       try {
         await runFfmpeg(args);
       } catch (audioErr) {
-        console.warn('Primary FFmpeg audio mix failed, falling back to clean AAC stream:', audioErr.message);
+        console.warn('Primary FFmpeg audio mix failed, falling back to clean stream:', audioErr.message);
         await runFfmpeg(buildSilentArgs());
       }
     } else {
       await runFfmpeg(buildSilentArgs());
     }
 
-    const mp4Buffer = fs.readFileSync(outputMp4Path);
+    const fileBuffer = fs.readFileSync(outputFilePath);
 
     return res.json({
       ok: true,
+      format: ext,
       downloadUrl: `/api/export/download/${sessionId}`,
-      mp4Base64: mp4Buffer.toString('base64'),
-      fileSize: mp4Buffer.length,
+      mp4Base64: fileBuffer.toString('base64'),
+      fileSize: fileBuffer.length,
       resolution: `${meta.width}x${meta.height}`,
       fps,
       duration: totalDuration,
-      codec: 'H.264 (Main@L4.0) + AAC-LC',
+      codec: isWebm ? 'VP9 (WebM) + Opus' : 'H.264 (Main@L4.0) + AAC-LC',
     });
   } catch (err) {
     console.error('Export finalize error:', err);
@@ -289,25 +325,28 @@ export async function handleExportDownload(req, res) {
   try {
     const { sessionId } = req.params;
     const sessionDir = getSessionDir(sessionId);
-    const outputMp4Path = path.join(sessionDir, 'vinstock-motion-export.mp4');
+    const webmPath = path.join(sessionDir, 'vinstock-motion-export.webm');
+    const mp4Path = path.join(sessionDir, 'vinstock-motion-export.mp4');
+    const isWebm = fs.existsSync(webmPath);
+    const targetPath = isWebm ? webmPath : mp4Path;
 
-    if (!fs.existsSync(outputMp4Path)) {
-      return res.status(404).json({ error: 'Exported MP4 file not found' });
+    if (!fs.existsSync(targetPath)) {
+      return res.status(404).json({ error: 'Exported file not found' });
     }
 
-    const stat = fs.statSync(outputMp4Path);
-    res.setHeader('Content-Type', 'video/mp4');
+    const stat = fs.statSync(targetPath);
+    res.setHeader('Content-Type', isWebm ? 'video/webm' : 'video/mp4');
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="vinstock-motion-export-${sessionId.slice(0, 6)}.mp4"`
+      `attachment; filename="vinstock-motion-export-${sessionId.slice(0, 6)}.${isWebm ? 'webm' : 'mp4'}"`
     );
 
-    const stream = fs.createReadStream(outputMp4Path);
+    const stream = fs.createReadStream(targetPath);
     stream.pipe(res);
   } catch (err) {
     console.error('Export download error:', err);
-    return res.status(500).json({ error: 'Failed to download MP4' });
+    return res.status(500).json({ error: 'Failed to download exported video' });
   }
 }

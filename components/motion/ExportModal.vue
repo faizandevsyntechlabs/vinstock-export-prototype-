@@ -3,8 +3,22 @@ import { computed } from 'vue';
 import { useMotionExport } from '../../composables/useMotionExport.js';
 import { useMotionTimeline } from '../../composables/useMotionTimeline.js';
 
-const { exportState, closeExportModal, startMp4Export, downloadMp4File } = useMotionExport();
-const { composition, videoTrack, animationTrack, audioTrack, animations } = useMotionTimeline();
+const {
+  exportState,
+  closeExportModal,
+  resolveExportDimensions,
+  startMp4Export,
+  downloadMp4File,
+} = useMotionExport();
+
+const {
+  composition,
+  animationTracks,
+  videoTracks,
+  audioTracks,
+  textTracks,
+  imageTracks,
+} = useMotionTimeline();
 
 const steps = [
   { key: 'preparing', label: 'Preparing' },
@@ -32,10 +46,7 @@ const isBusy = computed(() =>
   ['preparing', 'rendering', 'processing', 'encoding'].includes(exportState.status)
 );
 
-const activeAnimationName = computed(() => {
-  const found = animations.find((a) => a.id === animationTrack.animationId);
-  return found ? found.name : 'Animated Title';
-});
+const outputDims = computed(() => resolveExportDimensions());
 
 const formattedFileSize = computed(() => {
   if (!exportState.fileSize) return '';
@@ -56,9 +67,11 @@ const formattedFileSize = computed(() => {
       <!-- Modal Header -->
       <div class="px-6 py-4 border-b border-[#222733] flex items-center justify-between">
         <div>
-          <h3 class="font-display text-lg font-bold text-white">Export Composition to MP4</h3>
+          <h3 class="font-display text-lg font-bold text-white">
+            Export Composition ({{ exportState.format.toUpperCase() }})
+          </h3>
           <p class="text-xs text-slate-400 mt-0.5">
-            Deterministic HTML/Vue frame rasterization + FFmpeg H.264 / AAC muxing
+            Multi-layer HTML/Vue, Video, Audio, Text & Image rendering + FFmpeg / WebCodecs encoding
           </p>
         </div>
         <button
@@ -76,23 +89,34 @@ const formattedFileSize = computed(() => {
 
       <!-- Modal Body -->
       <div class="p-6 space-y-5 max-h-[80vh] overflow-y-auto">
-        <!-- Export Configuration & Track Summary -->
-        <div class="grid grid-cols-2 gap-3">
+        <!-- Format, Resolution & Engine Selectors -->
+        <div class="grid grid-cols-3 gap-3">
           <div>
-            <label class="block text-xs text-slate-400 mb-1">Output Resolution ({{ composition.aspectRatio }})</label>
+            <label class="block text-xs text-slate-400 mb-1">Format</label>
+            <select
+              v-model="exportState.format"
+              :disabled="isBusy"
+              class="w-full px-3 py-2 rounded-lg bg-[#0B0D11] border border-[#242A38] text-xs font-mono text-white disabled:opacity-50"
+            >
+              <option value="mp4">MP4 (H.264 + AAC)</option>
+              <option value="webm">WebM (VP9 + Opus)</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Resolution ({{ composition.aspectRatio }})</label>
             <select
               v-model="exportState.resolution"
               :disabled="isBusy"
               class="w-full px-3 py-2 rounded-lg bg-[#0B0D11] border border-[#242A38] text-xs font-mono text-white disabled:opacity-50"
             >
-              <option value="canvas">
-                Full Screen ({{ composition.width }} × {{ composition.height }})
-              </option>
-              <option value="720p-scale">
-                Scaled Fast ({{ Math.round((composition.width * 0.6667) / 2) * 2 }} × {{ Math.round((composition.height * 0.6667) / 2) * 2 }})
-              </option>
+              <option value="720p">720p HD</option>
+              <option value="1080p">1080p Full HD</option>
+              <option value="4k">4K UHD (2160p)</option>
+              <option value="canvas">Canvas ({{ composition.width }}×{{ composition.height }})</option>
             </select>
           </div>
+
           <div>
             <label class="block text-xs text-slate-400 mb-1">Encoding Engine</label>
             <select
@@ -100,40 +124,33 @@ const formattedFileSize = computed(() => {
               :disabled="isBusy"
               class="w-full px-3 py-2 rounded-lg bg-[#0B0D11] border border-[#242A38] text-xs font-mono text-white disabled:opacity-50"
             >
-              <option value="client-mp4">Browser H.264/AAC (Vercel Ready)</option>
-              <option value="server-ffmpeg">Server FFmpeg (Auto-Fallback)</option>
+              <option value="client-mp4">Browser WebCodecs (Fast)</option>
+              <option value="server-ffmpeg">Server FFmpeg</option>
             </select>
           </div>
         </div>
 
-        <!-- Synchronized Track Summary -->
-        <div class="p-3.5 rounded-lg bg-[#0B0D11] border border-[#222733] space-y-2 text-xs font-mono">
+        <!-- Synchronized Layer Summary -->
+        <div class="p-3.5 rounded-lg bg-[#0B0D11] border border-[#222733] space-y-1.5 text-xs font-mono">
           <div class="flex items-center justify-between text-slate-300">
-            <span class="text-amber-400">VINSTOCK Overlay</span>
-            <span>
-              {{ activeAnimationName }} ({{ (Number(animationTrack.startTime) || 0).toFixed(1) }}s –
-              {{ ((Number(animationTrack.startTime) || 0) + (Number(animationTrack.duration) || 0)).toFixed(1) }}s)
+            <span class="text-slate-400">Target Output</span>
+            <span class="text-white font-semibold">
+              {{ outputDims.targetWidth }} × {{ outputDims.targetHeight }}px · {{ exportState.fps }} FPS · {{ exportState.format.toUpperCase() }}
             </span>
           </div>
           <div class="flex items-center justify-between text-slate-300">
-            <span class="text-sky-400">Video Layer</span>
+            <span class="text-amber-400">HTML Motion Layers</span>
+            <span>{{ animationTracks.length }} layer(s)</span>
+          </div>
+          <div class="flex items-center justify-between text-slate-300">
+            <span class="text-sky-400">Video & Image Layers</span>
             <span>
-              {{
-                videoTrack.url
-                  ? `${videoTrack.fileName} (${(Number(videoTrack.startTime) || 0).toFixed(1)}s – ${((Number(videoTrack.startTime) || 0) + (Number(videoTrack.duration) || 0)).toFixed(1)}s)`
-                  : 'Canvas Backdrop Only'
-              }}
+              {{ videoTracks.filter((v) => v.url).length }} video(s) · {{ imageTracks.length }} image(s) · {{ textTracks.length }} text(s)
             </span>
           </div>
           <div class="flex items-center justify-between text-slate-300">
-            <span class="text-emerald-400">Audio Track</span>
-            <span>
-              {{
-                audioTrack.url && !audioTrack.muted
-                  ? `${audioTrack.fileName} (Vol ${Math.round(audioTrack.volume * 100)}%)`
-                  : 'Muted / Silent AAC Stream'
-              }}
-            </span>
+            <span class="text-emerald-400">Audio Layers</span>
+            <span>{{ audioTracks.filter((a) => a.url && !a.muted).length }} active audio track(s)</span>
           </div>
         </div>
 
@@ -182,13 +199,13 @@ const formattedFileSize = computed(() => {
           {{ exportState.errorMessage }}
         </div>
 
-        <!-- Completed MP4 Preview & Download -->
+        <!-- Completed Export Preview & Download -->
         <div
           v-if="exportState.status === 'complete' && exportState.downloadUrl"
           class="space-y-3 pt-1"
         >
           <div class="flex items-center justify-between text-xs font-mono text-emerald-400">
-            <span>MP4 Export Ready ({{ exportState.resolution }} · {{ exportState.codec }})</span>
+            <span>{{ exportState.format.toUpperCase() }} Ready ({{ outputDims.targetWidth }}×{{ outputDims.targetHeight }} · {{ exportState.codec }})</span>
             <span v-if="formattedFileSize">{{ formattedFileSize }}</span>
           </div>
 
@@ -224,7 +241,7 @@ const formattedFileSize = computed(() => {
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            <span>Download MP4</span>
+            <span>Download {{ exportState.format.toUpperCase() }}</span>
           </button>
 
           <button
@@ -237,8 +254,8 @@ const formattedFileSize = computed(() => {
               isBusy
                 ? 'Rendering & Encoding...'
                 : exportState.status === 'complete'
-                  ? 'Re-Export MP4'
-                  : 'Start MP4 Export'
+                  ? `Re-Export ${exportState.format.toUpperCase()}`
+                  : `Start ${exportState.format.toUpperCase()} Export`
             }}
           </button>
         </div>

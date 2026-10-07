@@ -1,6 +1,11 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
-import { useMotionTimeline, clamp } from '../../composables/useMotionTimeline.js';
+import {
+  useMotionTimeline,
+  isTrackActiveAt,
+  evaluateLayerSpatialState,
+  clamp,
+} from '../../composables/useMotionTimeline.js';
 import { useMediaSync } from '../../composables/useMediaSync.js';
 import AnimatedTitle from './animations/AnimatedTitle.vue';
 import LowerThird from './animations/LowerThird.vue';
@@ -10,13 +15,14 @@ import AnimatedBadge from './animations/AnimatedBadge.vue';
 const {
   composition,
   videoTrack,
-  animationTrack,
-  audioTrack,
+  videoTracks,
+  animationTracks,
+  textTracks,
+  imageTracks,
+  audioTracks,
   aspectPresets,
-  isVideoActive,
-  isAnimationActive,
-  animationProgress,
   selectTrack,
+  saveHistoryState,
   setScreenSize,
   setAspectRatioPreset,
   setZoom,
@@ -26,8 +32,6 @@ const {
 const { registerVideoElement, registerAudioElement } = useMediaSync();
 
 const viewportContainerRef = ref(null);
-const videoElementRef = ref(null);
-const audioElementRef = ref(null);
 
 const fitScale = ref(0.45);
 let resizeObserver = null;
@@ -65,12 +69,6 @@ watch(
 );
 
 onMounted(() => {
-  if (videoElementRef.value) {
-    registerVideoElement(videoElementRef.value);
-  }
-  if (audioElementRef.value) {
-    registerAudioElement(audioElementRef.value);
-  }
   calculateFitScale();
   if (typeof ResizeObserver !== 'undefined' && viewportContainerRef.value) {
     resizeObserver = new ResizeObserver(() => calculateFitScale());
@@ -88,8 +86,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerup', onPointerUp);
 });
 
-const activeAnimationComponent = computed(() => {
-  switch (animationTrack.animationId) {
+function resolveAnimationComponent(animationId) {
+  switch (animationId) {
     case 'animated-title':
       return AnimatedTitle;
     case 'lower-third':
@@ -101,7 +99,15 @@ const activeAnimationComponent = computed(() => {
     default:
       return AnimatedTitle;
   }
-});
+}
+
+function getAnimationItemProgress(aItem) {
+  const dur = Number(aItem.duration) || 0;
+  if (dur <= 0) return 0;
+  const cur = Number(composition.currentTime) || 0;
+  const start = Number(aItem.startTime) || 0;
+  return clamp((cur - start) / dur, 0, 1);
+}
 
 const scaledStageStyle = computed(() => {
   const w = Math.round((Number(composition.width) || 1920) * effectiveScale.value);
@@ -119,30 +125,98 @@ const logicalStageStyle = computed(() => ({
   transformOrigin: 'top left',
 }));
 
-const videoLayerStyle = computed(() => {
-  const s = Number(videoTrack.scale) || 1;
-  const w = (Number(videoTrack.width) || 1920) * s;
-  const h = (Number(videoTrack.height) || 1080) * s;
+function getCropClipPath(item) {
+  const top = clamp(Number(item.cropTop) || 0, 0, 45);
+  const right = clamp(Number(item.cropRight) || 0, 0, 45);
+  const bottom = clamp(Number(item.cropBottom) || 0, 0, 45);
+  const left = clamp(Number(item.cropLeft) || 0, 0, 45);
+  if (top === 0 && right === 0 && bottom === 0 && left === 0) return 'none';
+  return `inset(${top}% ${right}% ${bottom}% ${left}%)`;
+}
+
+function getVideoLayerStyle(vItem) {
+  const spatial = evaluateLayerSpatialState(vItem, composition.currentTime);
+  const w = (Number(vItem.width) || 1920) * spatial.scale;
+  const h = (Number(vItem.height) || 1080) * spatial.scale;
   return {
-    left: `${Number(videoTrack.x) || 0}px`,
-    top: `${Number(videoTrack.y) || 0}px`,
+    left: `${spatial.x}px`,
+    top: `${spatial.y}px`,
     width: `${w}px`,
     height: `${h}px`,
+    opacity: spatial.opacity,
+    transform: spatial.rotation ? `rotate(${spatial.rotation}deg)` : 'none',
+    transformOrigin: 'center center',
+    zIndex: Number(vItem.zIndex) || 10,
   };
-});
+}
 
-const animationLayerStyle = computed(() => ({
-  left: `${Number(animationTrack.x) || 960}px`,
-  top: `${Number(animationTrack.y) || 540}px`,
-}));
+function getImageLayerStyle(imgItem) {
+  const spatial = evaluateLayerSpatialState(imgItem, composition.currentTime);
+  const w = (Number(imgItem.width) || 320) * spatial.scale;
+  const h = (Number(imgItem.height) || 180) * spatial.scale;
+  return {
+    left: `${spatial.x}px`,
+    top: `${spatial.y}px`,
+    width: `${w}px`,
+    height: `${h}px`,
+    opacity: spatial.opacity,
+    transform: spatial.rotation ? `rotate(${spatial.rotation}deg)` : 'none',
+    transformOrigin: 'center center',
+    zIndex: Number(imgItem.zIndex) || 20,
+  };
+}
+
+function getTextLayerStyle(tItem) {
+  const spatial = evaluateLayerSpatialState(tItem, composition.currentTime);
+  return {
+    left: `${spatial.x}px`,
+    top: `${spatial.y}px`,
+    opacity: spatial.opacity,
+    transform: `translate(-50%, -50%) scale(${spatial.scale}) rotate(${spatial.rotation}deg)`,
+    transformOrigin: 'center center',
+    zIndex: Number(tItem.zIndex) || 25,
+  };
+}
+
+function getAnimationLayerStyle(aItem) {
+  const spatial = evaluateLayerSpatialState(aItem, composition.currentTime);
+  return {
+    left: `${spatial.x}px`,
+    top: `${spatial.y}px`,
+    opacity: spatial.opacity,
+    transform: spatial.rotation ? `rotate(${spatial.rotation}deg)` : 'none',
+    transformOrigin: 'center center',
+    zIndex: Number(aItem.zIndex) || 30,
+  };
+}
+
+function isVideoSelected(vItem) {
+  return composition.selectedTrack === 'video' && composition.selectedVideoId === vItem.id;
+}
+
+function isAnimationSelected(aItem) {
+  return composition.selectedTrack === 'animation' && composition.selectedAnimationId === aItem.id;
+}
+
+function isTextSelected(tItem) {
+  return composition.selectedTrack === 'text' && composition.selectedTextId === tItem.id;
+}
+
+function isImageSelected(imgItem) {
+  return composition.selectedTrack === 'image' && composition.selectedImageId === imgItem.id;
+}
+
+const hasAnyVideoUploaded = computed(() => videoTracks.some((v) => Boolean(v.url)));
 
 function fitVideoToScreen() {
+  saveHistoryState();
   videoTrack.x = 0;
   videoTrack.y = 0;
   videoTrack.width = Number(composition.width) || 1920;
   videoTrack.height = Number(composition.height) || 1080;
   videoTrack.scale = 1;
-  selectTrack('video');
+  videoTrack.rotation = 0;
+  selectTrack('video', videoTrack.id);
 }
 
 function onWheelZoom(e) {
@@ -153,45 +227,45 @@ function onWheelZoom(e) {
   }
 }
 
-// Interactive dragging & 8-way extending/resizing of Video Container, Animation, and Screen Frame
+// Interactive dragging & 8-way extending/resizing of Video, Image, Text, Animation, and Screen Frame
 const dragState = ref(null);
 
-function startVideoDrag(e) {
+function startLayerDrag(e, trackType, targetItem) {
   e.stopPropagation();
-  selectTrack('video');
+  saveHistoryState();
+  selectTrack(trackType, targetItem.id);
   dragState.value = {
-    type: 'video-move',
+    type: 'layer-move',
+    trackType,
+    targetTrack: targetItem,
     startX: e.clientX,
     startY: e.clientY,
-    initialX: Number(videoTrack.x) || 0,
-    initialY: Number(videoTrack.y) || 0,
+    initialX: Number(targetItem.x) || 0,
+    initialY: Number(targetItem.y) || 0,
   };
   window.addEventListener('pointermove', onPointerMove);
   window.addEventListener('pointerup', onPointerUp);
 }
 
-/**
- * 8-Directional Video Container Resize/Extend by Mouse:
- * directions: 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se'
- */
-function startVideoExtend(e, direction) {
+function startBoxExtend(e, trackType, targetItem, direction) {
   e.stopPropagation();
-  selectTrack('video');
-  const s = Number(videoTrack.scale) || 1;
-  // Normalize scale into width/height so edge dragging behaves 1:1 in logical pixels
-  const currentW = Math.round((Number(videoTrack.width) || 1920) * s);
-  const currentH = Math.round((Number(videoTrack.height) || 1080) * s);
-  videoTrack.width = currentW;
-  videoTrack.height = currentH;
-  videoTrack.scale = 1;
+  saveHistoryState();
+  selectTrack(trackType, targetItem.id);
+  const s = Number(targetItem.scale) || 1;
+  const currentW = Math.round((Number(targetItem.width) || 320) * s);
+  const currentH = Math.round((Number(targetItem.height) || 180) * s);
+  targetItem.width = currentW;
+  targetItem.height = currentH;
+  targetItem.scale = 1;
 
   dragState.value = {
-    type: 'video-extend',
+    type: 'box-extend',
+    targetTrack: targetItem,
     direction,
     startX: e.clientX,
     startY: e.clientY,
-    initialX: Number(videoTrack.x) || 0,
-    initialY: Number(videoTrack.y) || 0,
+    initialX: Number(targetItem.x) || 0,
+    initialY: Number(targetItem.y) || 0,
     initialW: currentW,
     initialH: currentH,
   };
@@ -201,6 +275,7 @@ function startVideoExtend(e, direction) {
 
 function startScreenExtend(e, direction) {
   e.stopPropagation();
+  saveHistoryState();
   dragState.value = {
     type: 'screen-extend',
     direction,
@@ -213,36 +288,26 @@ function startScreenExtend(e, direction) {
   window.addEventListener('pointerup', onPointerUp);
 }
 
-function startAnimationDrag(e) {
-  e.stopPropagation();
-  selectTrack('animation');
-  dragState.value = {
-    type: 'animation-move',
-    startX: e.clientX,
-    startY: e.clientY,
-    initialX: Number(animationTrack.x) || 960,
-    initialY: Number(animationTrack.y) || 540,
-  };
-  window.addEventListener('pointermove', onPointerMove);
-  window.addEventListener('pointerup', onPointerUp);
-}
-
 function onPointerMove(e) {
   if (!dragState.value) return;
   const scale = effectiveScale.value || 0.5;
   const dx = (e.clientX - dragState.value.startX) / scale;
   const dy = (e.clientY - dragState.value.startY) / scale;
 
-  if (dragState.value.type === 'video-move') {
-    videoTrack.x = Math.round(clamp(dragState.value.initialX + dx, -2400, 3200));
-    videoTrack.y = Math.round(clamp(dragState.value.initialY + dy, -2000, 2400));
-  } else if (dragState.value.type === 'video-extend') {
+  if (dragState.value.type === 'layer-move') {
+    const target = dragState.value.targetTrack;
+    if (!target) return;
+    target.x = Math.round(clamp(dragState.value.initialX + dx, -2400, 3840));
+    target.y = Math.round(clamp(dragState.value.initialY + dy, -2000, 2400));
+  } else if (dragState.value.type === 'box-extend') {
+    const target = dragState.value.targetTrack;
+    if (!target) return;
     const dir = dragState.value.direction;
     let nextX = dragState.value.initialX;
     let nextY = dragState.value.initialY;
     let nextW = dragState.value.initialW;
     let nextH = dragState.value.initialH;
-    const minSize = 120;
+    const minSize = 80;
 
     if (dir.includes('e')) {
       nextW = Math.round(clamp(dragState.value.initialW + dx, minSize, 5000));
@@ -265,10 +330,10 @@ function onPointerMove(e) {
       }
     }
 
-    videoTrack.x = nextX;
-    videoTrack.y = nextY;
-    videoTrack.width = nextW;
-    videoTrack.height = nextH;
+    target.x = nextX;
+    target.y = nextY;
+    target.width = nextW;
+    target.height = nextH;
   } else if (dragState.value.type === 'screen-extend') {
     const dir = dragState.value.direction;
     let nextW = dragState.value.initialW;
@@ -280,11 +345,6 @@ function onPointerMove(e) {
       nextH = Math.round(clamp(dragState.value.initialH + dy * 2, 360, 2160));
     }
     setScreenSize(nextW, nextH);
-  } else if (dragState.value.type === 'animation-move') {
-    const maxW = Number(composition.width) || 1920;
-    const maxH = Number(composition.height) || 1080;
-    animationTrack.x = Math.round(clamp(dragState.value.initialX + dx, 40, maxW - 40));
-    animationTrack.y = Math.round(clamp(dragState.value.initialY + dy, 40, maxH - 40));
   }
 }
 
@@ -307,7 +367,6 @@ function onPointerUp() {
     >
       <!-- Left: Screen Size (W × H) & Aspect Ratio Presets -->
       <div class="flex flex-wrap items-center gap-2.5">
-        <!-- Aspect Ratio Selector Buttons -->
         <div class="flex items-center gap-1 bg-[#0B0D11] p-1 rounded-lg border border-[#222733]">
           <button
             v-for="preset in aspectPresets"
@@ -326,7 +385,6 @@ function onPointerUp() {
           </button>
         </div>
 
-        <!-- Editable Screen Width × Height Inputs -->
         <div class="flex items-center gap-1.5 font-mono text-xs bg-[#0B0D11] px-2.5 py-1 rounded-lg border border-[#222733]">
           <span class="text-slate-400 text-[11px]">Screen:</span>
           <input
@@ -353,11 +411,10 @@ function onPointerUp() {
           <span class="text-slate-500 text-[10px]">px</span>
         </div>
 
-        <!-- Fit Video Container to Screen Button -->
         <button
           type="button"
           class="px-2.5 py-1.5 rounded-lg bg-[#151922] hover:bg-[#1E2430] text-sky-300 border border-[#242A38] font-mono text-[11px] transition-colors cursor-pointer whitespace-nowrap"
-          title="Stretch video container to match current screen dimensions"
+          title="Stretch selected video container to match current screen dimensions"
           @click="fitVideoToScreen"
         >
           Fit Video to Screen
@@ -419,12 +476,11 @@ function onPointerUp() {
 
     <!-- Scrollable / Zoomable Stage Viewport -->
     <div class="relative flex-1 flex items-center justify-center overflow-auto p-6">
-      <!-- Responsive Stage Frame Wrapper with Mouse Screen-Resize Handles -->
       <div
         class="relative shadow-2xl border border-[#262C3A] bg-[#0B0D11] rounded-md shrink-0 group/stage"
         :style="scaledStageStyle"
       >
-        <!-- Outer Stage Right Edge Handle (Extend Screen Width by Mouse) -->
+        <!-- Outer Stage Right Edge Handle -->
         <div
           class="absolute top-0 bottom-0 -right-2.5 w-2.5 cursor-ew-resize z-40 flex items-center justify-center opacity-0 group-hover/stage:opacity-100 transition-opacity"
           title="Drag to extend screen width"
@@ -433,7 +489,7 @@ function onPointerUp() {
           <div class="w-1 h-10 rounded-full bg-amber-400/80" />
         </div>
 
-        <!-- Outer Stage Bottom Edge Handle (Extend Screen Height by Mouse) -->
+        <!-- Outer Stage Bottom Edge Handle -->
         <div
           class="absolute left-0 right-0 -bottom-2.5 h-2.5 cursor-ns-resize z-40 flex items-center justify-center opacity-0 group-hover/stage:opacity-100 transition-opacity"
           title="Drag to extend screen height"
@@ -442,7 +498,7 @@ function onPointerUp() {
           <div class="h-1 w-10 rounded-full bg-amber-400/80" />
         </div>
 
-        <!-- Outer Stage Bottom-Right Corner Handle (Extend Screen Size by Mouse) -->
+        <!-- Outer Stage Bottom-Right Corner Handle -->
         <div
           class="absolute -bottom-3 -right-3 w-4 h-4 cursor-nwse-resize z-40 flex items-center justify-center opacity-0 group-hover/stage:opacity-100 transition-opacity"
           title="Drag corner to resize screen dimensions"
@@ -453,94 +509,138 @@ function onPointerUp() {
 
         <!-- Logical Composition Coordinate Space -->
         <div class="relative overflow-hidden bg-[#0B0D11] rounded-md" :style="logicalStageStyle">
-          <!-- Subtle Studio Safe-Area Guides -->
           <div
             class="pointer-events-none absolute inset-[4%] border border-dashed border-white/[0.06] rounded"
           />
 
-          <!-- LAYER 1: Uploaded Video Track with 8-Directional Mouse Extend Handles -->
+          <!-- LAYER GROUP A: All Uploaded Video Tracks with 8-Directional Mouse Extend Handles & Crop -->
           <div
-            v-show="videoTrack.url && isVideoActive"
+            v-for="vItem in videoTracks"
+            :key="vItem.id"
+            v-show="vItem.url && isTrackActiveAt(vItem, composition.currentTime)"
             class="absolute cursor-move group/video"
             :class="{
-              'ring-2 ring-sky-400': composition.selectedTrack === 'video',
-              'hover:ring-2 hover:ring-sky-400/60': composition.selectedTrack !== 'video',
+              'ring-2 ring-sky-400': isVideoSelected(vItem),
+              'hover:ring-2 hover:ring-sky-400/60': !isVideoSelected(vItem),
             }"
-            :style="videoLayerStyle"
-            @pointerdown="startVideoDrag"
+            :style="getVideoLayerStyle(vItem)"
+            @pointerdown="startLayerDrag($event, 'video', vItem)"
           >
             <video
-              ref="videoElementRef"
-              :src="videoTrack.url"
+              :ref="(el) => registerVideoElement(vItem.id, el)"
+              :src="vItem.url"
               class="w-full h-full object-fill pointer-events-none block"
+              :style="{ clipPath: getCropClipPath(vItem) }"
               playsinline
               preload="auto"
             />
 
-            <!-- Video Dimensions Badge on Hover / Selection -->
+            <!-- Video Dimensions Badge on Selection -->
             <div
-              v-if="composition.selectedTrack === 'video'"
+              v-if="isVideoSelected(vItem)"
               class="pointer-events-none absolute top-3 left-3 px-3 py-1 rounded bg-slate-950/85 border border-sky-400/50 text-sky-300 font-mono text-lg shadow"
             >
-              Video: {{ Math.round(videoTrack.width * (videoTrack.scale || 1)) }} ×
-              {{ Math.round(videoTrack.height * (videoTrack.scale || 1)) }}px (Drag edges/corners to extend)
+              {{ vItem.label }} · z{{ vItem.zIndex }} ·
+              {{ Math.round(vItem.width * (vItem.scale || 1)) }}×{{ Math.round(vItem.height * (vItem.scale || 1)) }}px
             </div>
 
-            <!-- 8-Directional Mouse Extend Handles for Video Container -->
-            <!-- East (Right Edge) -->
-            <div
-              class="absolute top-1/2 -right-3 -translate-y-1/2 w-6 h-20 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ew-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
-              title="Drag right edge to extend video width"
-              @pointerdown.stop="startVideoExtend($event, 'e')"
-            />
-            <!-- West (Left Edge) -->
-            <div
-              class="absolute top-1/2 -left-3 -translate-y-1/2 w-6 h-20 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ew-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
-              title="Drag left edge to extend video width"
-              @pointerdown.stop="startVideoExtend($event, 'w')"
-            />
-            <!-- South (Bottom Edge) -->
-            <div
-              class="absolute left-1/2 -bottom-3 -translate-x-1/2 w-20 h-6 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ns-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
-              title="Drag bottom edge to extend video height"
-              @pointerdown.stop="startVideoExtend($event, 's')"
-            />
-            <!-- North (Top Edge) -->
-            <div
-              class="absolute left-1/2 -top-3 -translate-x-1/2 w-20 h-6 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ns-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
-              title="Drag top edge to extend video height"
-              @pointerdown.stop="startVideoExtend($event, 'n')"
-            />
+            <!-- 8-Directional Mouse Extend Handles when this Video Track is selected -->
+            <template v-if="isVideoSelected(vItem)">
+              <div
+                class="absolute top-1/2 -right-3 -translate-y-1/2 w-6 h-20 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ew-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'e')"
+              />
+              <div
+                class="absolute top-1/2 -left-3 -translate-y-1/2 w-6 h-20 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ew-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'w')"
+              />
+              <div
+                class="absolute left-1/2 -bottom-3 -translate-x-1/2 w-20 h-6 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ns-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 's')"
+              />
+              <div
+                class="absolute left-1/2 -top-3 -translate-x-1/2 w-20 h-6 bg-sky-400 border-2 border-slate-950 rounded-full cursor-ns-resize shadow-lg opacity-90 hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'n')"
+              />
+              <div
+                class="absolute -bottom-4 -right-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nwse-resize shadow-lg hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'se')"
+              />
+              <div
+                class="absolute -bottom-4 -left-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nesw-resize shadow-lg hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'sw')"
+              />
+              <div
+                class="absolute -top-4 -right-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nesw-resize shadow-lg hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'ne')"
+              />
+              <div
+                class="absolute -top-4 -left-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nwse-resize shadow-lg hover:scale-110 transition-transform"
+                @pointerdown.stop="startBoxExtend($event, 'video', vItem, 'nw')"
+              />
+            </template>
+          </div>
 
-            <!-- South-East (Bottom-Right Corner) -->
-            <div
-              class="absolute -bottom-4 -right-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nwse-resize shadow-lg hover:scale-110 transition-transform"
-              title="Drag corner to extend video container"
-              @pointerdown.stop="startVideoExtend($event, 'se')"
+          <!-- LAYER GROUP B: All Image Overlay Layers with 8-Way Resize & Crop -->
+          <div
+            v-for="imgItem in imageTracks"
+            :key="imgItem.id"
+            v-show="imgItem.url && isTrackActiveAt(imgItem, composition.currentTime)"
+            class="absolute cursor-move"
+            :class="{
+              'ring-2 ring-fuchsia-400': isImageSelected(imgItem),
+              'hover:ring-2 hover:ring-fuchsia-400/60': !isImageSelected(imgItem),
+            }"
+            :style="getImageLayerStyle(imgItem)"
+            @pointerdown="startLayerDrag($event, 'image', imgItem)"
+          >
+            <img
+              :src="imgItem.url"
+              :alt="imgItem.label"
+              class="w-full h-full object-fill pointer-events-none block rounded"
+              :style="{ clipPath: getCropClipPath(imgItem) }"
             />
-            <!-- South-West (Bottom-Left Corner) -->
+            <template v-if="isImageSelected(imgItem)">
+              <div
+                class="absolute -bottom-3 -right-3 w-6 h-6 bg-fuchsia-400 border-2 border-slate-950 rounded-sm cursor-nwse-resize shadow-lg"
+                @pointerdown.stop="startBoxExtend($event, 'image', imgItem, 'se')"
+              />
+              <div
+                class="absolute -top-3 -left-3 w-6 h-6 bg-fuchsia-400 border-2 border-slate-950 rounded-sm cursor-nwse-resize shadow-lg"
+                @pointerdown.stop="startBoxExtend($event, 'image', imgItem, 'nw')"
+              />
+            </template>
+          </div>
+
+          <!-- LAYER GROUP C: All Text Overlay Layers -->
+          <div
+            v-for="tItem in textTracks"
+            :key="tItem.id"
+            v-show="isTrackActiveAt(tItem, composition.currentTime)"
+            class="absolute cursor-move"
+            :style="getTextLayerStyle(tItem)"
+            @pointerdown="startLayerDrag($event, 'text', tItem)"
+          >
             <div
-              class="absolute -bottom-4 -left-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nesw-resize shadow-lg hover:scale-110 transition-transform"
-              title="Drag corner to extend video container"
-              @pointerdown.stop="startVideoExtend($event, 'sw')"
-            />
-            <!-- North-East (Top-Right Corner) -->
-            <div
-              class="absolute -top-4 -right-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nesw-resize shadow-lg hover:scale-110 transition-transform"
-              title="Drag corner to extend video container"
-              @pointerdown.stop="startVideoExtend($event, 'ne')"
-            />
-            <!-- North-West (Top-Left Corner) -->
-            <div
-              class="absolute -top-4 -left-4 w-8 h-8 bg-sky-400 border-2 border-slate-950 rounded-sm cursor-nwse-resize shadow-lg hover:scale-110 transition-transform"
-              title="Drag corner to extend video container"
-              @pointerdown.stop="startVideoExtend($event, 'nw')"
-            />
+              class="px-7 py-3.5 rounded-xl border-2 whitespace-nowrap shadow-xl transition-shadow"
+              :class="{
+                'ring-4 ring-purple-400/80': isTextSelected(tItem),
+              }"
+              :style="{
+                color: tItem.color || '#FFFFFF',
+                backgroundColor: tItem.backgroundColor || 'rgba(15, 23, 42, 0.78)',
+                borderColor: tItem.borderColor || '#38BDF8',
+                fontSize: `${Number(tItem.fontSize) || 52}px`,
+                fontWeight: tItem.fontWeight || '700',
+              }"
+            >
+              {{ tItem.text }}
+            </div>
           </div>
 
           <!-- Empty Video Hint when no video uploaded -->
           <div
-            v-if="!videoTrack.url"
+            v-if="!hasAnyVideoUploaded"
             class="pointer-events-none absolute inset-0 flex flex-col items-center justify-center text-slate-500"
           >
             <p class="font-mono text-xl tracking-wide text-slate-500/70">
@@ -548,27 +648,29 @@ function onPointerUp() {
             </p>
           </div>
 
-          <!-- LAYER 2: VINSTOCK HTML/Vue Animation Overlay -->
+          <!-- LAYER GROUP D: Multiple VINSTOCK HTML/Vue Animation Overlays -->
           <div
-            v-if="isAnimationActive"
-            class="absolute z-20 cursor-move"
-            :style="animationLayerStyle"
-            @pointerdown="startAnimationDrag"
+            v-for="aItem in animationTracks"
+            :key="aItem.id"
+            v-show="isTrackActiveAt(aItem, composition.currentTime)"
+            class="absolute cursor-move"
+            :style="getAnimationLayerStyle(aItem)"
+            @pointerdown="startLayerDrag($event, 'animation', aItem)"
           >
             <div
               class="relative rounded-xl transition-shadow"
               :class="{
                 'ring-2 ring-amber-400/80 ring-offset-4 ring-offset-transparent':
-                  composition.selectedTrack === 'animation',
+                  isAnimationSelected(aItem),
               }"
             >
               <component
-                :is="activeAnimationComponent"
-                :progress="animationProgress"
-                :duration="animationTrack.duration"
-                :speed="animationTrack.animationSpeed"
-                :scale="animationTrack.scale"
-                :custom-properties="animationTrack.customProperties"
+                :is="resolveAnimationComponent(aItem.animationId)"
+                :progress="getAnimationItemProgress(aItem)"
+                :duration="aItem.duration"
+                :speed="aItem.animationSpeed"
+                :scale="evaluateLayerSpatialState(aItem, composition.currentTime).scale"
+                :custom-properties="aItem.customProperties"
               />
             </div>
           </div>
@@ -576,10 +678,12 @@ function onPointerUp() {
       </div>
     </div>
 
-    <!-- LAYER 3: Synchronized Master Audio Element (non-visual) -->
+    <!-- SYNCHRONIZED MASTER AUDIO ELEMENTS (Supports Multiple Audio Tracks) -->
     <audio
-      ref="audioElementRef"
-      :src="audioTrack.url"
+      v-for="aItem in audioTracks"
+      :key="aItem.id"
+      :ref="(el) => registerAudioElement(aItem.id, el)"
+      :src="aItem.url"
       preload="auto"
       class="hidden"
     />

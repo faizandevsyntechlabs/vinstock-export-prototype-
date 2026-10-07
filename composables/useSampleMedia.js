@@ -218,11 +218,14 @@ export function useSampleMedia() {
       audioTrack.startTime = 0.5;
       audioTrack.duration = 8.5;
 
-      const videoFile = await createSampleVideoFile(5);
+      const videoFile = await createSampleVideoFile(6);
       if (videoFile) {
         setVideoFile(videoFile);
+        videoTrack.naturalDuration = 6.0;
+        videoTrack.trimStart = 0;
+        videoTrack.trimEnd = 6.0;
         videoTrack.startTime = 0;
-        videoTrack.duration = 9.0;
+        videoTrack.duration = 6.0;
       }
     } finally {
       isGeneratingSample.value = false;
