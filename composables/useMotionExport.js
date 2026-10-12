@@ -956,7 +956,7 @@ export function useMotionExport() {
 
     const { targetWidth, targetHeight } = resolveExportDimensions();
     const fps = Number(exportState.fps) || 30;
-    const totalDuration = clamp(Number(composition.duration) || 10, 1, 30);
+    const totalDuration = clamp(Number(composition.duration) || 10, 1, 600);
     const totalFrames = Math.max(1, Math.round(totalDuration * fps));
 
     exportState.totalFrames = totalFrames;

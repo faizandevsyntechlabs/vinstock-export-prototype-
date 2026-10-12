@@ -34,7 +34,7 @@ function stepFrame(deltaFrames) {
 }
 
 function updateDuration(e) {
-  const val = clamp(Number(e.target.value) || 10, 4, 30);
+  const val = clamp(Number(e.target.value) || 10, 4, 600);
   composition.duration = val;
   if (composition.currentTime > val) {
     seekTo(val);
@@ -224,7 +224,7 @@ function splitSelectedAtPlayhead() {
         id="comp-duration-input"
         type="number"
         min="4"
-        max="30"
+        max="600"
         step="1"
         :value="composition.duration"
         class="w-14 px-1.5 py-1 rounded bg-[#0B0D11] border border-[#222733] text-slate-200 text-right font-mono focus:outline-none focus:border-amber-500"

@@ -219,6 +219,51 @@ function fitVideoToScreen() {
   selectTrack('video', videoTrack.id);
 }
 
+function onVideoMetadataLoaded(vItem, e) {
+  const el = e?.target;
+  if (!el || !vItem) return;
+  const rawDur = el.duration;
+  const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : (Number(vItem.naturalDuration) || 10);
+  const cleanDur = Number(dur.toFixed(2));
+
+  vItem.naturalDuration = cleanDur;
+  if (el.videoWidth) vItem.naturalWidth = el.videoWidth;
+  if (el.videoHeight) vItem.naturalHeight = el.videoHeight;
+
+  // Auto-expand track duration if it's currently at initial default (<= 6s or 10s)
+  if (!vItem.duration || vItem.duration <= 6 || vItem.duration === 10) {
+    vItem.duration = cleanDur;
+    vItem.trimStart = 0;
+    vItem.trimEnd = cleanDur;
+  }
+
+  // Ensure master composition duration encompasses the video
+  const neededEnd = Number(((Number(vItem.startTime) || 0) + cleanDur).toFixed(2));
+  if (neededEnd > composition.duration || composition.duration <= 10) {
+    composition.duration = Math.max(10, neededEnd);
+  }
+}
+
+function onAudioMetadataLoaded(aItem, e) {
+  const el = e?.target;
+  if (!el || !aItem) return;
+  const rawDur = el.duration;
+  const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : (Number(aItem.naturalDuration) || 8.5);
+  const cleanDur = Number(dur.toFixed(2));
+
+  aItem.naturalDuration = cleanDur;
+  if (!aItem.duration || aItem.duration <= 8.5 || aItem.duration === 10) {
+    aItem.duration = cleanDur;
+    aItem.trimStart = 0;
+    aItem.trimEnd = cleanDur;
+  }
+
+  const neededEnd = Number(((Number(aItem.startTime) || 0) + cleanDur).toFixed(2));
+  if (neededEnd > composition.duration || composition.duration <= 10) {
+    composition.duration = Math.max(10, neededEnd);
+  }
+}
+
 function onWheelZoom(e) {
   if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
@@ -533,6 +578,7 @@ function onPointerUp() {
               :style="{ clipPath: getCropClipPath(vItem) }"
               playsinline
               preload="auto"
+              @loadedmetadata="onVideoMetadataLoaded(vItem, $event)"
             />
 
             <!-- Video Dimensions Badge on Selection -->
@@ -686,6 +732,7 @@ function onPointerUp() {
       :src="aItem.url"
       preload="auto"
       class="hidden"
+      @loadedmetadata="onAudioMetadataLoaded(aItem, $event)"
     />
   </div>
 </template>

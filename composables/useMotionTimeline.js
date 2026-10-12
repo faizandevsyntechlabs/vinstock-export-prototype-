@@ -640,6 +640,11 @@ export function isAudioTrackActiveAt(aTrack, timeSec) {
 let rafId = null;
 let lastFrameTimestamp = null;
 const seekListeners = new Set();
+let mediaTimeProvider = null;
+
+export function setMediaTimeProvider(providerFn) {
+  mediaTimeProvider = providerFn;
+}
 
 export function useMotionTimeline() {
   const canUndo = computed(() => undoStack.value.length > 0);
@@ -716,10 +721,22 @@ export function useMotionTimeline() {
       lastFrameTimestamp = now;
     }
 
-    const deltaSec = (now - lastFrameTimestamp) / 1000;
+    const deltaSec = Math.min(0.1, (now - lastFrameTimestamp) / 1000);
     lastFrameTimestamp = now;
 
-    const nextTime = composition.currentTime + deltaSec;
+    let nextTime = composition.currentTime + deltaSec;
+    if (mediaTimeProvider) {
+      try {
+        const mediaTime = mediaTimeProvider(composition.currentTime, deltaSec);
+        if (typeof mediaTime === 'number' && Number.isFinite(mediaTime)) {
+          const diff = mediaTime - nextTime;
+          if (Math.abs(diff) > 0.2) {
+            nextTime += diff * 0.25;
+          }
+        }
+      } catch (_e) {}
+    }
+
     if (nextTime >= composition.duration) {
       composition.currentTime = composition.duration;
       composition.isPlaying = false;
@@ -1138,19 +1155,39 @@ export function useMotionTimeline() {
     const tempVideo = document.createElement('video');
     tempVideo.preload = 'metadata';
     tempVideo.src = url;
-    tempVideo.onloadedmetadata = () => {
-      const dur =
-        Number.isFinite(tempVideo.duration) && tempVideo.duration > 0 ? tempVideo.duration : 6;
+    const applyMetadata = (rawDur) => {
+      const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 10;
       const cleanDur = Number(dur.toFixed(2));
       targetTrack.naturalDuration = cleanDur;
       targetTrack.naturalWidth = tempVideo.videoWidth || 1920;
       targetTrack.naturalHeight = tempVideo.videoHeight || 1080;
       targetTrack.trimStart = 0;
       targetTrack.trimEnd = cleanDur;
-      targetTrack.duration =
-        Number(Math.min(cleanDur, Math.max(1, composition.duration - targetTrack.startTime)).toFixed(2)) ||
-        cleanDur;
-      targetTrack.trimEnd = Number(Math.min(cleanDur, targetTrack.duration).toFixed(2));
+      targetTrack.duration = cleanDur;
+
+      // Auto-expand composition duration so the entire uploaded video plays without stopping early!
+      const neededEnd = Number((Number(targetTrack.startTime || 0) + cleanDur).toFixed(2));
+      if (neededEnd > composition.duration || composition.duration <= 10) {
+        composition.duration = Math.max(10, neededEnd);
+      }
+    };
+
+    tempVideo.onerror = () => {
+      applyMetadata(10);
+    };
+
+    tempVideo.onloadedmetadata = () => {
+      if (tempVideo.duration === Infinity) {
+        tempVideo.currentTime = 1e101;
+        tempVideo.ontimeupdate = () => {
+          tempVideo.ontimeupdate = null;
+          const dur = Number.isFinite(tempVideo.duration) && tempVideo.duration > 0 ? tempVideo.duration : 10;
+          applyMetadata(dur);
+          tempVideo.currentTime = 0;
+        };
+        return;
+      }
+      applyMetadata(tempVideo.duration);
     };
   }
 
@@ -1309,17 +1346,36 @@ export function useMotionTimeline() {
     const tempAudio = document.createElement('audio');
     tempAudio.preload = 'metadata';
     tempAudio.src = url;
-    tempAudio.onloadedmetadata = () => {
-      const dur =
-        Number.isFinite(tempAudio.duration) && tempAudio.duration > 0 ? tempAudio.duration : 8.5;
+    const applyMetadata = (rawDur) => {
+      const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 8.5;
       const cleanDur = Number(dur.toFixed(2));
       targetTrack.naturalDuration = cleanDur;
       targetTrack.trimStart = 0;
       targetTrack.trimEnd = cleanDur;
-      targetTrack.duration =
-        Number(Math.min(cleanDur, Math.max(1, composition.duration - targetTrack.startTime)).toFixed(2)) ||
-        8;
-      targetTrack.trimEnd = Number(Math.min(cleanDur, targetTrack.duration).toFixed(2));
+      targetTrack.duration = cleanDur;
+
+      const neededEnd = Number((Number(targetTrack.startTime || 0) + cleanDur).toFixed(2));
+      if (neededEnd > composition.duration || composition.duration <= 10) {
+        composition.duration = Math.max(10, neededEnd);
+      }
+    };
+
+    tempAudio.onerror = () => {
+      applyMetadata(8.5);
+    };
+
+    tempAudio.onloadedmetadata = () => {
+      if (tempAudio.duration === Infinity) {
+        tempAudio.currentTime = 1e101;
+        tempAudio.ontimeupdate = () => {
+          tempAudio.ontimeupdate = null;
+          const dur = Number.isFinite(tempAudio.duration) && tempAudio.duration > 0 ? tempAudio.duration : 10;
+          applyMetadata(dur);
+          tempAudio.currentTime = 0;
+        };
+        return;
+      }
+      applyMetadata(tempAudio.duration);
     };
   }
 
@@ -1598,5 +1654,6 @@ export function useMotionTimeline() {
     setAudioTrim,
     splitAudioAtPlayhead,
     formatTimecode,
+    setMediaTimeProvider,
   };
 }

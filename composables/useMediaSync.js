@@ -1,5 +1,5 @@
 import { watch, onBeforeUnmount } from 'vue';
-import { useMotionTimeline, clamp } from './useMotionTimeline.js';
+import { useMotionTimeline, isTrackActiveAt, clamp } from './useMotionTimeline.js';
 
 const videoElementsMap = new Map();
 const audioElementsMap = new Map();
@@ -14,48 +14,112 @@ export function useMediaSync() {
     isVideoActive,
     isAudioActive,
     onSeek,
+    setMediaTimeProvider,
   } = useMotionTimeline();
 
-  function registerVideoElement(trackIdOrEl, maybeEl) {
-    if (typeof trackIdOrEl === 'string') {
-      if (maybeEl) {
-        videoElementsMap.set(trackIdOrEl, maybeEl);
-      } else {
-        videoElementsMap.delete(trackIdOrEl);
+  // Register master timeline media clock provider:
+  // When an active video (or audio) is playing smoothly, anchor the timeline's clock
+  // to the media element's hardware presentation clock. This completely eliminates
+  // drift and avoids continuous decoder-flushing seeks!
+  if (typeof setMediaTimeProvider === 'function') {
+    setMediaTimeProvider((currentMasterTime) => {
+      // 1. Try active playing video
+      for (const vTrack of videoTracks) {
+        const videoEl = videoElementsMap.get(vTrack.id);
+        if (
+          videoEl &&
+          !videoEl.paused &&
+          !videoEl.seeking &&
+          videoEl.readyState >= 2 &&
+          vTrack.url &&
+          isTrackActiveAt(vTrack, currentMasterTime)
+        ) {
+          const vStart = Number(vTrack.startTime) || 0;
+          const trimIn = Math.max(0, Number(vTrack.trimStart) || 0);
+          const rate = clamp(Number(vTrack.playbackRate) || 1, 0.25, 4);
+          const mediaMasterTime = vStart + (videoEl.currentTime - trimIn) / rate;
+          if (Math.abs(currentMasterTime - mediaMasterTime) < 0.9) {
+            return mediaMasterTime;
+          }
+        }
       }
-    } else if (trackIdOrEl) {
-      const id = videoTracks[0]?.id || 'video_1';
-      videoElementsMap.set(id, trackIdOrEl);
+
+      // 2. Otherwise try active playing audio
+      for (const aTrack of audioTracks) {
+        const audioEl = audioElementsMap.get(aTrack.id);
+        if (
+          audioEl &&
+          !audioEl.paused &&
+          !audioEl.seeking &&
+          audioEl.readyState >= 2 &&
+          aTrack.url &&
+          !aTrack.muted &&
+          isTrackActiveAt(aTrack, currentMasterTime)
+        ) {
+          const aStart = Number(aTrack.startTime) || 0;
+          const trimIn = Math.max(0, Number(aTrack.trimStart) || 0);
+          const rate = clamp(Number(aTrack.playbackRate) || 1, 0.25, 4);
+          const mediaMasterTime = aStart + (audioEl.currentTime - trimIn) / rate;
+          if (Math.abs(currentMasterTime - mediaMasterTime) < 0.9) {
+            return mediaMasterTime;
+          }
+        }
+      }
+
+      return null;
+    });
+  }
+
+  function registerVideoElement(trackIdOrEl, maybeEl) {
+    const id = typeof trackIdOrEl === 'string' ? trackIdOrEl : (videoTracks[0]?.id || 'video_1');
+    const el = typeof trackIdOrEl === 'string' ? maybeEl : trackIdOrEl;
+
+    const existing = videoElementsMap.get(id);
+    if (!el) {
+      if (existing) videoElementsMap.delete(id);
+      return;
     }
-    syncVideoState(true);
+    if (existing === el) {
+      // Element is already registered! Vue template re-renders call inline refs constantly;
+      // returning here prevents continuous force-seeks and decoder pipeline thrashing.
+      return;
+    }
+
+    videoElementsMap.set(id, el);
+    const track = videoTracks.find((v) => v.id === id) || videoTracks[0];
+    if (track) {
+      syncSingleVideoTrack(track, false);
+    }
   }
 
   function registerAudioElement(trackIdOrEl, maybeEl) {
-    if (typeof trackIdOrEl === 'string') {
-      if (maybeEl) {
-        audioElementsMap.set(trackIdOrEl, maybeEl);
-      } else {
-        audioElementsMap.delete(trackIdOrEl);
-      }
-    } else if (trackIdOrEl) {
-      const id = audioTracks[0]?.id || 'audio_1';
-      audioElementsMap.set(id, trackIdOrEl);
+    const id = typeof trackIdOrEl === 'string' ? trackIdOrEl : (audioTracks[0]?.id || 'audio_1');
+    const el = typeof trackIdOrEl === 'string' ? maybeEl : trackIdOrEl;
+
+    const existing = audioElementsMap.get(id);
+    if (!el) {
+      if (existing) audioElementsMap.delete(id);
+      return;
     }
-    syncAudioState(true);
+    if (existing === el) {
+      return;
+    }
+
+    audioElementsMap.set(id, el);
+    const track = audioTracks.find((a) => a.id === id) || audioTracks[0];
+    if (track) {
+      syncSingleAudioTrack(track, false);
+    }
   }
 
   function syncSingleVideoTrack(vTrack, forceSeek = false) {
     const videoEl = videoElementsMap.get(vTrack.id);
     if (!videoEl || !vTrack.url || composition.isExporting) return;
 
-    const rate = clamp(Number(vTrack.playbackRate) || 1, 0.25, 4);
-    if (Math.abs((videoEl.playbackRate || 1) - rate) > 0.01) {
-      try {
-        videoEl.playbackRate = rate;
-      } catch (_e) {}
-    }
-
-    videoEl.volume = clamp(Number(vTrack.volume ?? 0.8), 0, 1);
+    const userRate = clamp(Number(vTrack.playbackRate) || 1, 0.25, 4);
+    const vol = clamp(Number(vTrack.volume ?? 0.8), 0, 1);
+    videoEl.volume = vol;
+    videoEl.muted = vol === 0;
 
     const vStart = Number(vTrack.startTime) || 0;
     const vDur = Math.max(0.1, Number(vTrack.duration) || 0);
@@ -69,32 +133,69 @@ export function useMediaSync() {
       composition.currentTime <= vStart + vDur;
 
     if (withinWindow) {
-      const clampedSourceTime = clamp(trimIn + elapsedInClip * rate, trimIn, trimOut);
-      const drift = Math.abs((videoEl.currentTime || 0) - clampedSourceTime);
+      const clampedSourceTime = clamp(trimIn + elapsedInClip * userRate, trimIn, trimOut);
+      const currentTime = videoEl.currentTime || 0;
+      const drift = currentTime - clampedSourceTime; // positive: video leads, negative: video lags
+      const absDrift = Math.abs(drift);
 
       if (forceSeek || !composition.isPlaying) {
-        if (drift > 0.03) {
+        // Paused, scrubbing, or explicit seek: seek precisely to clampedSourceTime
+        if (absDrift > 0.02 && !videoEl.seeking) {
           try {
             videoEl.currentTime = clampedSourceTime;
           } catch (_e) {}
         }
-      } else if (drift > 0.24 * rate) {
-        try {
-          videoEl.currentTime = clampedSourceTime;
-        } catch (_e) {}
+        if (Math.abs((videoEl.playbackRate || 1) - userRate) > 0.01) {
+          try {
+            videoEl.playbackRate = userRate;
+          } catch (_e) {}
+        }
+      } else {
+        // Continuous playback:
+        // Use Phase-Locked Loop (PLL) micro-adjustments instead of seeking!
+        // This eliminates hardware decoder thrashing, dropped frames, and slow-motion stutter.
+        if (absDrift > 0.9 && !videoEl.seeking) {
+          try {
+            videoEl.currentTime = clampedSourceTime;
+          } catch (_e) {}
+        } else {
+          let targetRate = userRate;
+          if (drift < -0.06) {
+            targetRate = Math.min(4, userRate * 1.05);
+          } else if (drift > 0.06) {
+            targetRate = Math.max(0.25, userRate * 0.95);
+          }
+          if (Math.abs((videoEl.playbackRate || 1) - targetRate) > 0.01) {
+            try {
+              videoEl.playbackRate = targetRate;
+            } catch (_e) {}
+          }
+        }
       }
 
-      if (composition.isPlaying && videoEl.paused && (videoEl.currentTime || 0) < trimOut - 0.02) {
-        videoEl.play().catch(() => {});
-      } else if (
-        (!composition.isPlaying || (videoEl.currentTime || 0) >= trimOut) &&
-        !videoEl.paused
-      ) {
+      if (composition.isPlaying) {
+        if (videoEl.paused && currentTime < trimOut - 0.05) {
+          const p = videoEl.play();
+          if (p !== undefined) {
+            p.catch(() => {});
+          }
+        } else if (currentTime >= trimOut - 0.02 && !videoEl.paused) {
+          videoEl.pause();
+        }
+      } else if (!videoEl.paused) {
         videoEl.pause();
       }
     } else {
       if (!videoEl.paused) {
         videoEl.pause();
+      }
+      if (forceSeek && !videoEl.seeking) {
+        const target = composition.currentTime < vStart ? trimIn : trimOut;
+        if (Math.abs((videoEl.currentTime || 0) - target) > 0.05) {
+          try {
+            videoEl.currentTime = target;
+          } catch (_e) {}
+        }
       }
     }
   }
@@ -124,13 +225,7 @@ export function useMediaSync() {
     const audioEl = audioElementsMap.get(aTrack.id);
     if (!audioEl || !aTrack.url || composition.isExporting) return;
 
-    const rate = clamp(Number(aTrack.playbackRate) || 1, 0.25, 4);
-    if (Math.abs((audioEl.playbackRate || 1) - rate) > 0.01) {
-      try {
-        audioEl.playbackRate = rate;
-      } catch (_e) {}
-    }
-
+    const userRate = clamp(Number(aTrack.playbackRate) || 1, 0.25, 4);
     const aStart = Number(aTrack.startTime) || 0;
     const aDur = Math.max(0.1, Number(aTrack.duration) || 0);
     const trimIn = Math.max(0, Number(aTrack.trimStart) || 0);
@@ -149,32 +244,65 @@ export function useMediaSync() {
       : clamp(Number(aTrack.volume ?? 0.85) * fadeMult, 0, 1);
 
     if (withinWindow && !aTrack.muted) {
-      const clampedLocal = clamp(trimIn + elapsedInClip * rate, trimIn, trimOut);
-      const drift = Math.abs((audioEl.currentTime || 0) - clampedLocal);
+      const clampedLocal = clamp(trimIn + elapsedInClip * userRate, trimIn, trimOut);
+      const currentTime = audioEl.currentTime || 0;
+      const drift = currentTime - clampedLocal;
+      const absDrift = Math.abs(drift);
 
       if (forceSeek || !composition.isPlaying) {
-        if (drift > 0.03) {
+        if (absDrift > 0.03 && !audioEl.seeking) {
           try {
             audioEl.currentTime = clampedLocal;
           } catch (_e) {}
         }
-      } else if (drift > 0.24 * rate) {
-        try {
-          audioEl.currentTime = clampedLocal;
-        } catch (_e) {}
+        if (Math.abs((audioEl.playbackRate || 1) - userRate) > 0.01) {
+          try {
+            audioEl.playbackRate = userRate;
+          } catch (_e) {}
+        }
+      } else {
+        if (absDrift > 0.9 && !audioEl.seeking) {
+          try {
+            audioEl.currentTime = clampedLocal;
+          } catch (_e) {}
+        } else {
+          let targetRate = userRate;
+          if (drift < -0.06) {
+            targetRate = Math.min(4, userRate * 1.05);
+          } else if (drift > 0.06) {
+            targetRate = Math.max(0.25, userRate * 0.95);
+          }
+          if (Math.abs((audioEl.playbackRate || 1) - targetRate) > 0.01) {
+            try {
+              audioEl.playbackRate = targetRate;
+            } catch (_e) {}
+          }
+        }
       }
 
-      if (composition.isPlaying && audioEl.paused && (audioEl.currentTime || 0) < trimOut - 0.02) {
-        audioEl.play().catch(() => {});
-      } else if (
-        (!composition.isPlaying || (audioEl.currentTime || 0) >= trimOut) &&
-        !audioEl.paused
-      ) {
+      if (composition.isPlaying) {
+        if (audioEl.paused && currentTime < trimOut - 0.05) {
+          const p = audioEl.play();
+          if (p !== undefined) {
+            p.catch(() => {});
+          }
+        } else if (currentTime >= trimOut - 0.02 && !audioEl.paused) {
+          audioEl.pause();
+        }
+      } else if (!audioEl.paused) {
         audioEl.pause();
       }
     } else {
       if (!audioEl.paused) {
         audioEl.pause();
+      }
+      if (forceSeek && !audioEl.seeking) {
+        const target = composition.currentTime < aStart ? trimIn : trimOut;
+        if (Math.abs((audioEl.currentTime || 0) - target) > 0.05) {
+          try {
+            audioEl.currentTime = target;
+          } catch (_e) {}
+        }
       }
     }
   }
@@ -254,7 +382,6 @@ export function useMediaSync() {
     return results.filter(Boolean);
   }
 
-  // Legacy single-video helper for backward compatibility
   async function seekVideoElementForExport(masterTimeSec) {
     const first = await seekSingleVideoForExport(videoTrack, masterTimeSec);
     return first ? first.videoEl : null;
